@@ -35,16 +35,18 @@ VIBE allows one to:
 
 ## Citation
 
-If you use **VIBE** in your work, please cite the corresponding paper:
+If you use **VIBE** in your work, please cite the software as:
 
 ```bibtex
-@article{VIBE_placeholder,
-  title   = {Simulating vacuum birefringence with a diffractive beam propagation code},
-  author  = {Matheron, Aimé and Smíd, Michal and Zepf, Matt and Karbstein, Felix},
-  journal = {TBD},
-  year    = {TBD},
-  doi     = {TBD}
+@software{VIBE,
+  author  = {Aimé Matheron, Michal Smíd, Matt Zepf and Felix Karbstein},
+  title   = {VIBE: Vacuum Interaction Birefringence Explorer},
+  year    = {2025},
+  version = {v1.0.0},
+  doi     = {10.5281/zenodo.17979735},
+  url     = {https://github.com/amatheron/VIBE}
 }
+
 ```
 
 
