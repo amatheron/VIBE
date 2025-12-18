@@ -29,11 +29,8 @@ VIBE allows one to:
 
 - simulate **vacuum birefringence pump–probe experiments** with **experimentally realistic beam profiles**,  
 - include **diffraction, absorption, clipping, and aberrations** from optical components,  
-- propagate **multiple polarization channels** (probe, VB∥, VB⊥) consistently through the setup,  
-- model **dark-field detection schemes** where the signal is spatially separated from the probe background,  
+- propagate **multiple polarization channels** (probe, VB∥, VB⊥) consistently through the setup,   
 - estimate **absolute signal photon numbers** at the detector with moderate numerical cost.
-
-The approach is particularly well suited for **XFEL–laser experiments**, where diffraction and optical elements play a central role in background suppression and signal extraction.
 
 
 ## Citation
@@ -49,6 +46,8 @@ If you use **VIBE** in your work, please cite the corresponding paper:
   doi     = {TBD}
 }
 ```
+
+
 ---
 
 VIBE/
