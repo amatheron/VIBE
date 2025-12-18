@@ -1,0 +1,23 @@
+# ----------------------------
+# Runtime / generated content
+# ----------------------------
+VIBE_outputs/**
+!VIBE_outputs/**/.gitkeep
+
+bash/bash_output/**
+bash/.ipynb_checkpoints/**
+.ipynb_checkpoints/**
+
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints
+
+# SLURM
+*.out
+*.err
+*.log
+
+bash/
+src/*.egg-info/

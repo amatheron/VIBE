@@ -1,0 +1,101 @@
+start:
+  position: -7
+  type: image
+  
+beam_shaper:
+  position: -6
+  type: aperture
+  shape: gaussian
+  invert: 0
+  power: 20
+  size: 0.0002
+  
+
+L1:
+  in: 1
+  position: -4
+  type: lens
+  num_lenses: 1
+  f: 4.0
+  size: 0.002
+  seiboth: false
+  celestre: false
+  scatterer: false
+  
+TCC:
+  type: imager
+  position: 0
+  VB_signal: 1
+  
+Det:
+  position: 4.0
+  type: imager
+  roi: 13
+  roi2: 75
+  
+Xbeam:
+  offset: 0
+  size: 0.002
+  photonenergy: 12914
+  photons_total: 2e11          # photons in the pulse (at beam_shaper plane)
+  X_FWHM_duration: 25e-15      # Xray FWHM duration [s].
+  
+IRLaser:
+  phi_VB_deg: 45               # Polarisation angle between IRLaser and Xray beam
+  IR_Energy_J: 4.8
+  IR_FWHM_duration: 30e-15
+  IR_wavelength: 800e-9
+  IR_FWHM_gaussian: 1.3e-6     # FWHM diameter in the case of a Gaussian laser pulse
+  IR_x_offset_m: 0
+  IR_y_offset_m: 0
+  Timing_jitter: 0.0           # Timing mismatch at focus between the pump and the probe, in [s].
+  IR_2Dmap:
+  - "gaussian"                 # Choose : "external" or "gaussian". Choose whether using an external 2D image or a gaussian map for the IR focus.
+  - "match_integral"           # Choose : "match_integral" or "match_peak" to match the integral of the signal (such that the IR_Energy_J is matched) or the peak value of intensity for a  gaussian calculation.
+  - "/home/yu79deg/darkfield_p5438/src/darkfield/IR_focus.png"       # Path of the external IR focus image
+  - 0                          # Calibration in μm/pixel. If equal to = 0, the code will match the FWHM of external map laser to be equal to IR_FWHM_gaussian.
+
+
+simulation:
+  save_fig_and_pickle: 1
+  save_individual_figures: 1
+  intensity_units: photons   # or 'relative'
+  beamdiv: 0.0001
+  do_positive: true
+  focus_test: false
+  focus_test_zoom: 150
+  name: as_filename
+  pptype: N
+  project: Aime
+  propsize: 0.0015
+  Zoom_global: 2              # Global zoom of all the simulation
+  smooth: 0
+  subfigure_size_px: 0       
+  version: 1
+  intensity_ylim:
+  - 1.0e-10
+  - 2.0
+  profiles_xlim:
+  - 0
+  - 200
+  figs_to_save:
+  - beam_shaper
+  - TCC
+  - Det
+  - flow
+  figs_log: 1
+  edge_damping:
+  - 0.25
+  edge_damping_shape: circular
+  flow:
+  - -4.2
+  - 4.2
+  - 0.01
+  flow_auto_save: 0
+  flow_plot_gyax:
+  - -650.0
+  - 650.0
+  - 1.0
+  flow_plot_clim:
+  - 1e-11
+  - 50
