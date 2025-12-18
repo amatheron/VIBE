@@ -7,44 +7,77 @@ Vacuum Interaction Birefringence Explorer
 </p>
 
 
-# VIBE : Vacuum Interaction Birefringence Explorer
-
 ## What this project does
 
-VIBE simulates the **dark-field** X-ray experiment where an XFEL probe collides with an IR pump at the **target chamber center (TCC)** to produce a **vacuum birefringence (VB)** signal. The code is **diffraction-based** and uses [LightPipes] for scalar wave propagation. It computes fields and intensities across planes from the source to the detector, including apertures, CRLs, masks, and optional air-scattering, and can now synthesize and propagate the **VB∥** and **VB⊥** channels alongside the main probe.
+**VIBE (Vacuum Interaction Birefringence Explorer)** is a **diffraction-based simulation toolkit** for modelling **quantum-vacuum signals**, in particular **vacuum birefringence**, in **realistic laser–laser and laser–XFEL pump–probe experiments**.
 
-> New in recent versions
->
-> * VB signal generation at TCC and multi-channel propagation (main, VB∥, VB⊥).
-> * Physical **flux units**: choose `intensity_units: photons` to work in photons/m² (or switch to relative/W cm⁻² where relevant). Flow plots and integrals respect this scaling.
+The code extends the **diffractive beam propagation framework LightPipes** by embedding a **quantum-vacuum emission module** directly into the optical propagation pipeline. This makes it possible to simulate, within a *single and self-consistent framework*:
 
----
+- the **generation** of vacuum birefringence signals at the pump–probe interaction point, and  
+- the **subsequent propagation** of both the probe background and the induced quantum-vacuum signal through a **complete experimental beamline**, including lenses, apertures, masks, slits, and detectors.
 
-## Repository layout (high level)
+### Core idea
 
-- `Launch_VIBE.py` — Driver: loads a YAML configuration, builds the element list, and launches the simulation via `VIBE.main_VIBE(...)`.
-- `VIBE.py` — Core simulator and utilities (optical elements, propagation, plotting, flows, VB).  
-  Key internals include the **main loop `main_VIBE`**, **element application**, **Henke-table index handling**, **aperture & phase/thickness maps**, **air-scattering**, and **VB masks**.
-- `optical_constants/*.txt` — Henke optical constants used by `get_index(...)` to build δ, β at runtime.
-- `darkfield/*` — Project helpers (utils, color maps, regularized propagation). `regularized_propagation_v2` supports numerically stable long-range propagation.
-- `flows/`, `figs/` — Auto-saved figures (flow waterfalls, mosaics, snapshots), controlled from YAML.
-- `Air_scattering/*.npz` — Precomputed Geant4 distributions used by the air-scattering module at the detector.
+Instead of treating vacuum birefringence as a purely far-field or analytical effect, VIBE expresses the dominant quantum-vacuum contribution at the probe frequency as a **virtual source field** defined in the interaction plane.  
+This source field is constructed from the **local overlap between the pump intensity and the probe field**, and is then propagated using the **same Fresnel diffraction formalism** as any conventional optical field.
 
----
+As a result, quantum-vacuum signals are handled **on exactly the same footing** as standard diffraction, imaging, and absorption effects.
 
-## How a simulation is defined
+### What this enables
 
-Everything is driven by a **YAML file** describing:
+VIBE allows one to:
 
-- **Global beam & run settings:** photon energy, wavelength, pixels `N`, physical window `propsize`, beam size/tilts, unit system, plotting options, figure mosaics, etc.  
-- **Optical elements:** ordered in Z with `position` and `type` (`aperture`, `phaseplate`, `parabolic_lens`, `reg/dereg`, `zoom_window`, `Det`, `TCC`, `beam_shaper`, …) and element parameters (sizes, thicknesses, ROC, materials, custom profiles, switches like `in: 0/1`).  
-- **VB block (at TCC):** turning on `VB_signal: 1` triggers VB mask construction from the IR intensity map and spawns the VB channels.
+- simulate **vacuum birefringence pump–probe experiments** with **experimentally realistic beam profiles**,  
+- include **diffraction, absorption, clipping, and aberrations** from optical components,  
+- propagate **multiple polarization channels** (probe, VB∥, VB⊥) consistently through the setup,  
+- model **dark-field detection schemes** where the signal is spatially separated from the probe background,  
+- estimate **absolute signal photon numbers** at the detector with moderate numerical cost.
 
-`Launch_VIBE.py` reads this YAML, constructs the element list `[(z, name, dict), …]`, and calls:
+The approach is particularly well suited for **XFEL–laser experiments**, where diffraction and optical elements play a central role in background suppression and signal extraction.
 
-```python
-params, trans, figs = VIBE.main_VIBE(params, elements)
+
+## Citation
+
+If you use **VIBE** in your work, please cite the corresponding paper:
+
+```bibtex
+@article{VIBE_placeholder,
+  title   = {Simulating vacuum birefringence with a diffractive beam propagation code},
+  author  = {Matheron, Aimé and Smíd, Michal and Zepf, Matt and Karbstein, Felix},
+  journal = {TBD},
+  year    = {TBD},
+  doi     = {TBD}
+}
 ```
+---
+
+VIBE/
+├── src/
+│   └── vibe/
+│       ├── VIBE.py                # Main simulation engine
+│       ├── utils.py               # Generic utilities
+│       ├── bash_config.py         # HPC / batch job helpers
+│       ├── mmmUtils_v2.py          # Numerical & optical helper routines
+│       ├── wavefront_fitting.py   # Wavefront analysis tools
+│       ├── regularized_propagation_v2.py
+│       ├── rossendorfer_farbenliste.py
+│       ├── optical_constants/
+│       │   ├── Be.txt
+│       │   └── diamond.txt
+│       └── Dabam2D/                # 2D surface-defect maps (mirrors / optics)
+│
+├── VIBE_outputs/                   # All simulation outputs and diagnostics
+│   ├── figures/
+│   ├── flows/
+│   ├── pickles/
+│   ├── planes/
+│   ├── Lens_diags/
+│   └── VB_figures/
+│
+├── notebooks/                      # Example notebooks
+├── yamls/                          # YAML-based simulation templates
+├── docs/                           # Documentation assets (logo, figures)
+└── pyproject.toml                  # Packaging and dependencies
 
 ---
 
