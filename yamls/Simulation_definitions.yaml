@@ -1,0 +1,261 @@
+start:                               # Start plane name
+  position: -7                       # Plane position [m]  
+  type: image                        # Type of plane (image = does nothing but output a diag at this plane)  
+  
+beam_shaper:                         # Beam shaper object : shapes the initial probe beam
+  position: -6                       # Plane position [m]  
+  type: aperture                     # Type of plane (aperture = blocks some part of the beam with a given profile)
+  shape: gaussian                    # Gaussian shape (with maximum transmission at the center)
+  invert: 0                          # Inversion (if =1 the minimum transmission is at the center)
+  power: 20                          # Super-Gaussian power. >6 is very close to a flat-top beam. 1 = gaussian shape
+  size: 0.0002                       # FWHM size (in intensity) in [m]
+  
+beam_shaper:                         # Beam shaper object : shapes the initial probe beam
+  position: -10                      # Plane position [m]  
+  type: aperture                     # Type of plane (aperture = blocks some part of the beam with a given profile)
+  shape: external_map                # Option to put an external (experimentally measured) map as an input for the probe beam.
+  path: "/home/yu79deg/VIBE/src/vibe/Xray_initial_beam.png"
+  center: "barycenter"               # The code recenters the beam. If center: "barycenter", the barycenter of the external map is placed at the center of the simulation box. If center: "max", the maximum of the map is put at the center. If center: "no", no recentering is applied.
+  center_sigma_px: 2.0               # Only used if center: "max". If so, it smoothes the external map with a typical sigma pixel (low pass filter) to avoid selecting the maximum corresponding to a hot-spot of the external image.
+  calibration: 0.738188976           # If > 0, calibration in μm/pixel of the external image. If = 0 then the beam FWHM is taken to be equal to the "size" value of this section.
+  size: 0.000140                     # Only used if calibration = 0 (ignored when calibration > 0). Size (FWHM in intensity) of the beam.
+  x_offset_um: 0.0                   # Horizontal offset of the beam center, in [um]
+  y_offset_um: 0.0                   # Vertical offset of the beam center, in [um]
+
+reg1:                                # Regularisation object : regularises the propagation of the beam.
+  in: 0                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: 2.0                      # Plane position [m]  
+  type: reg                          # Regularisation plane : this activates the regularisation propagation option such that the box size evolves with the beam size.
+  plot: 0                            # Option to plot the field at the reg1 plane.
+
+dereg1:                              # deregularisation object : deregularises the propagation of the beam.
+  position: -1.5                     # Plane position [m]  
+  type: dereg                        # Deregularisation plane : this desactivates the regularisation propagation option such that the box size stays constant when the beam propagates.
+  plot: 1                            # Option to plot the field at the dereg1 plane.
+
+
+L1:                                  # Lens 1
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -4                       # Plane position [m]
+  type: lens                         # Type of plane (lens = ideal parabollic shaped lens with no defects)
+  num_lenses: 1                      # Number of stacked lenses (can be >1 in the case of CRLs). This number controls the number of times the defect maps "Celestre" and "Seiboth" are activated.
+  f: 4.0                             # Focal length in [m]
+  size: 0.002                        # Aperture (diameter) size [m]
+  seiboth: false                     # Low frequency defects map 
+  celestre: false                    # High frequency defects map 
+  scatterer: false                   # Ball structures for defect modelling
+
+L2:                                  # Lens 2
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -4                       # Plane position [m]
+  type: lens_reg                     # Lens with a regularised propagation. The box size will follow the lens focus profile and will shrink to smaller sizes.
+  num_lenses: 1                      # Number of stacked lenses (can be >1 in the case of CRLs)
+  f: 4.0                             # Focal length in [m]
+  size: 0.002                        # Aperture (diameter) size [m]
+  seiboth: false                     # Low frequency defects map 
+  celestre: false                    # High frequency defects map 
+  scatterer: false                   # Ball structures for defect modelling
+
+
+Custom_CRL1:                         # Custom CRL, mainly used for Xray probes.
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -1.215                   # Plane position [m]
+  type: Custom_CRL                   # CRL object with all parameters related to CRL.
+  ROC: 0.000125                      # CRL Radius Of Curvature (ROC), in [m]
+  L: 0.0005                          # CRL Thickness (often also noted D, in RXOptics for example), in [m]
+  A: 0.000475                        # CRL Aperture (often also noted 2xR0, in RXOptics for example), in [m]
+  nb_lenses: 3.0                     # Number of individual lenses stacked in the CRL stack.
+  lens_material: diamond             # Lens material. For the moment, only "diamond" and 'Be' (Beryllium) are supported, and for a given energy range. To update this, see /VIBE/src/vibe/optical_constants/ and define a new table from CXRO website.
+  add_aperture: 1                    # Add a hard aperture (block the field in a step), at the lens aperture diameter.
+  defects: 1                         # Add defects to the lenses. All the block from this part can be removed to simulate a defect free CRL.
+  experimental_data:                 # Experimental data taken to simulation the lenses defects. The defects are taken from the DABAM2D librairy. If the number of data maps is smaller than the total number of lenses, some maps will be applied several times. If it is longer than the number of lenses, the last maps will just be ignored.
+  - dabam2d-0076
+  - dabam2d-0077
+  - dabam2d-0078
+  rescale_dabam: 1                   # 0 or 1. Rescale the experimental maps to the lens aperture or not. If activated, the high frequency defects are not conserved. If not activated, the experimental map has to be bigger than the simulation lens aperture.
+  defect_type: 3                     # 1 : Low frequency defects only. 2 : High frequency defects only. 3 : Low + high frequencies (= full map). The cutoff on frequencies is defined as the Z = 37th Zernike polynomial in Noll notation. 
+  remove_avg_profile: 1              # Option to remove the additionnal "low frequency" azimuthal contribution which is no fitted by Zernike polynoms, and add it to the low frequency part. This option should be activated for a reliable description of Low / high frequency abberations.
+  Custom_zernike:                    # Option to overwrite the Zernike fit with custom Zernike polynomials defined below. The list can be as long as desired.
+  - 0                                # Activated or not (0 or 1)
+  - 11                               # Number of the first Zernike polynom to include (in Noll notation.)
+  - 1.5e-06                          # Amplitude of the polynom, in [m].
+  - 18                               # Number of the second Zernike polynom to include (in Noll notation.)
+  - -4.5e-06                         # Amplitude of the polynom, in [m].
+
+
+
+O0:                                  # Obstacle 0
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -3.2                     # Plane position [m]
+  elem: W                            # Tungsten object
+  shape: wireslitup                  # Shape : wireslitup : simulates a half blocker, on the top side only, and with a realistic cylinder-like edge.
+  r: 0.0002                          # Diameter of the half cylinders defined on the side of the slit, in [m]
+  size: -50.0e-6                     # Diameter of the slit *if there was a second blocker symetrically around the center axis*. In practice, corresponds to twice of the distance between the wireslitup and the axis.
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+
+
+O1:                                  # Obstacle 1 : half blocker
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -3.2                     # Plane position [m]
+  elem: W                            # Tungsten object
+  shape: wireslitdown                # Shape : wireslitdown : simulates a half blocker, on the bottom side only, and with a realistic cylinder-like edge.
+  r: 0.0002                          # Diameter of the half cylinders defined on the side of the slit, in [m]
+  size: -50.0e-6                     # Diameter of the slit *if there was a second blocker symetrically around the center axis*. In practice, corresponds to twice of the distance between the wireslitup and the axis.
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+
+
+O2:                                  # Obstacle 2 : vertical, serrated wire
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  position: -7.4                     # Plane position [m]
+  elem: W                            # Tungsten object
+  shape: realwire                    # Shape : realwire simulates a cylinder spanning in the vertical direction. It computes the adequate transmission and phase (attenuated on the edges).
+  size: 0.00022211                   # Size = diameter of the wire, in [m]
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+  defect_type: triangle              # Option to add defects and/or serration to objects, to act on diffraction on the object edges. defect_type can be 'sine','triangle', 'sawtooth', 'real_triangle'
+  defect_lambda: 2.0e-05             # Distance between two peaks of the serration, in [m].
+  defect_amplitude: 2.0e-05          # Amplitude of the serration, in [m].
+
+
+O3_dot:                              # Obstacle 3 : circular disk blocker
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  elem: W                            # Tungsten object 
+  shape: serrated_circle             # Shape : serrated_circle simulates a circle with a radial serration
+  size: 240.0e-6                     # Size = diameter of the disk, in [m]
+  thickness: 240.0e-6                # Thickness of the disk aperture, in [m].
+  position: 2.3001                   # Plane position [m]
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+  defect_type: triangle              # Option to add defects and/or serration to objects, to act on diffraction on the object edges. defect_type for a serrated_circle has to be "triangle"
+  defect_n_teeth: 300                # Total number of teeths on the full 360° disk
+  defect_amplitude: 1.0e-05          # Amplitude of the serration, in [m].
+
+
+A1:                                  # Aperture 1
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  elem: W                            # Tungsten object
+  r: 0.0002                          # Only defined for the shape "wireslit". Diameter of the half cylinders defined on the side of the slit, in [m]
+  shape: wireslit                    # Vertical slit shape with edges in half-cylinders, to mimick a real experiment profile.
+  size: 6.0e-05                      # Size of the slit, from the apex of each half cylinder, in [m].
+  position: 2.575                    # Plane position [m]
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+  orientate_horizontal: 1            # If the aperture needs to be oriented horizontally rather than vertically.
+  defect_type: real_triangle         # 'real_triangle' describes a triangle shape in which the edges are not perfectly sharp, but they have a small radius.
+  defect_lambda: 2.0e-05             # Distance between two peaks of the serration, in [m].
+  defect_amplitude: 2.0e-05          # Amplitude of the serration, in [m].
+  defect_radius: 0.1e-06             # Radius of curvature of the apex of traignel, in [m].
+
+
+A2:                                  # Aperture 2
+  in: 1                              # If = 1 the object is applied. If = 0 it is bypassed
+  elem: Au                           # Gold object
+  thickness: 2.0e-05                 # Thickness of the Pinhole like aperture, in [m].
+  shape: circle                      # Blocks in a circle (disk) shape.
+  size: 6.0e-05                      # Diameter of the circle (=disk) in [m].
+  position: 2.575                    # Plane position [m]
+  type: aperture                     # Type : aperture = blocker. It acts as a transmission (and phase) object.
+
+
+Plasma:                             # Plasma simple model
+  in: 1                             # If = 1 the object is applied. If = 0 it is bypassed
+  type: gazjet                      # The "gazjet" type simulates a (pure phase object) plasma refractive index, for a given density. At the moment, only works for Xray optics.
+  position: 0.001                   # Plane position [m]
+  density: 5.0e22                   # Density of the plasma in cc
+  profile: "gaussian"               # Gaussian or rectangle transverse shape
+  Size_transv: 10.0e-6              # Transverse size of the plasma (for Gaussian shape = FWHM), in [m].
+  Size_long: 50.0e-9                # Longitudinal size of gaz jet (for Gaussian shape = FWHM), in [m].
+  Offset_transv: 0.0                # Transverse offset of gaz jet, in [m].
+  modulate: 1                       # Option to modulate the plasma density [0 or 1]
+  mod_period_um: 2.0                # If the "modulate" option is activated : Modulation period of the oscilations, in [um].
+
+
+TCC:                                 # Interaction plane between pump and probe. It must be defined at z = 0
+  type: imager                       # Type of plane (imager = does nothing but output a diag at this plane)
+  position: 0                        # Plane position [m] : TCC must always be defined at z = 0
+  VB_signal: 1                       # Vacuum Birefringence signal calculator. Spawns two (perp and parallel) channels at TCC and bundle them with the initial probe field.
+  
+Det:                                 # Detector plane where the total number of photons in a given detector area are indicated
+  position: 4.0                      # Plane position [m]
+  type: imager                       # Type of plane (imager = does nothing but output a diag at this plane)
+  roi: 13                            # Region of Interest : square area in [um] corresponding to the detector pixel size. The integrated signal will be calculated for this area.
+  roi2: 75                           # Possibility to define a second area size to compare with the first one.
+  AirScat: 1                         # Air scattering simulation : simulates a given Air thickness just before the detector. This option requires to be coupled to a GEANT4 basis simulation. Some examples can be provided upon request. 
+  compute_transmission: 1            # Compute the transmission of the probe through air.
+  use_symmetric_kernel: True         # Performs a azimuthal symmetry around the propagation axis to generate a smoother air convolution map.
+  test_identity_kernel: True         # Test mode : indentity kernel is a Dirac peak centered at (0,0) to test if the convolution gives back the original image.
+  crop_to_odd: True                  # Crops the detector image to an odd number of pixels to facilitates the Fourier based convolution with the air convolution scattering map.
+  
+Xbeam:                               # Probe beam properties. In this case a X-ray beam, but can be any frequency.
+  offset: 0                          # Offset of the beam at the 'start' plane, in [m]
+  size: 0.002                        # Beam size (FWHM of intensity) at the start plane, in [m]
+  photonenergy: 12914                # Photon energy of the probe beam, in eV
+  photons_total: 2e11                # Total number of photons in the beam defined at the beam_shaper plane.
+  X_FWHM_duration: 25e-15            # Probe FWHM duration [s] (assuming a Gaussian pulsed beam).
+  
+IRLaser:                             # Pump beam properties. In this case the pump beam is an IR laser.
+  phi_VB_deg: 45                     # Polarisation angle between the pump and the probe beam
+  IR_Energy_J: 4.8                   # Total energy of the pulse, at TCC, in [J]
+  IR_FWHM_duration: 30e-15           # Pump FWHM duration [s], (assuming a Gaussian pulsed beam).
+  IR_wavelength: 800e-9              # Pump central wavelength [m]
+  IR_FWHM_gaussian: 1.3e-6           # Pump FWHM diameter (in intensity), in [m]
+  IR_x_offset_m: 0                   # Pump offset in horizontal direction at the focus, in [m]
+  IR_y_offset_m: 0                   # Pump offset in vertical direction at the focus, in [m]
+  Timing_jitter: 0.0                 # Timing mismatch at focus between the pump and the probe, in [s].
+  IR_2Dmap:
+  - "gaussian"                       # "external" or "gaussian". Choose between using an external 2D image or a Gaussian shape for the pump focus.
+  - "match_integral"                 # "match_integral" or "match_peak" to match the integral of the signal (such that the IR_Energy_J is matched) or the peak value of intensity for a Gaussian calculation.
+  - "/home/yu79deg/VIBE/src/vibe/IR_focus.png"       # Path of the external IR focus image
+  - 0                                # Calibration in μm/pixel of the external image. If equal to = 0, the code will match the FWHM of external map laser to be equal to IR_FWHM_gaussian.
+
+IRLaser:                             # Pump beam properties. In this case the pump beam is an IR laser.
+  phi_VB_deg: 45                     # Polarisation angle between the pump and the probe beam
+  IR_Energy_J: 4.8                   # Total energy of the pulse, at TCC, in [J]
+  IR_FWHM_duration: 30e-15           # Pump FWHM duration [s], (assuming a Gaussian pulsed beam).
+  IR_wavelength: 800e-9              # Pump central wavelength [m]
+  IR_FWHM_gaussian: 1.3e-6           # Pump FWHM diameter (in intensity), in [m]
+  IR_x_offset_m: 0                   # Pump offset in horizontal direction at the focus, in [m]
+  IR_y_offset_m: 0                   # Pump offset in vertical direction at the focus, in [m]
+  Timing_jitter: 0.0                 # Timing mismatch at focus between the pump and the probe, in [s].
+  f_number: 1.0                      # f-number (f/D) of the final focusing optic
+  IR_focal_length: 0.15              # Focal length [m] of the final focusing optic (should not play a role in the focusing, but does in the numerics).
+  fraction_blocked: 0.2              # Option to block a vertical fraction of the pump beam. Fraction of the diameter blocked, from [0 to 1]. The fraction is defined as the ratio of the beam diameter, and the block size.
+  IR_2Dmap:                          # Options for the calculation of the focus map
+  - fringes                          # "fringes" calculates the 2D FFT of the Near-field defined by the parameters above. It allows for any geometry in the nearfield to be properly simulated in the focus.
+  - match_integral                   # "match_integral" matches the overall factor such that the total integral matches the total energy of the beam.
+
+
+simulation:                          # General simulation parameters
+  save_fig_and_pickle: 1             # 1 : All figures and pickles are saved (can be heavy). 0 : Only the important figures (flow_plot) and a light "summary.npz" are saved.
+  save_individual_figures: 1         # 1 : Saving the individual figures in /VIBE/VIBE_outputs/planes (can be a bit heavy if the resolution is high). 0 : not saving individual figures.
+  intensity_units: photons           # 'photons' or 'relative'. Unit of the intensity displayed. For 'photons' the code makes sure that "photons_total" photons are at the beam_shaper plane. For 'relative', the first plane intensity maximum will be set to unity.
+  beamdiv: 0.0001                    # Initial beam divergence in [rad]
+  name: as_filename                  # Simulation name (used for Pickles and figures). If = "as_filename" it will take the same name as the yaml input file.
+  pptype: N                          # Simulation resolution type
+  propsize: 0.0015                   # Total simulation grid size in [m].
+  Zoom_global: 2                     # Zoom of diagnostics. For example, a zoom = 2 mean that the simulation box size displayed on figures will go from -propsize/4 to + propsize/4.
+  subfigure_size_px: 0               # Pixel resolution used for saved subfigures. 0 : Use the full simulation resolution. >0 downsample figures to at most that many pixels per axis.  
+  intensity_ylim:                    # Intensity ylim for "/figures/...summary"
+  - 1.0e-10
+  - 2.0
+  profiles_xlim:                     # Intensity xlim for "/figures/...summary"
+  - 0
+  - 200
+  figs_to_save:                      # List of the Planes to save. The name should match the plane name. If including "flow" the simulation will save a lot of plane to create the "flow_plot".
+  - beam_shaper
+  - TCC
+  - Det
+  - flow
+  figs_log: 1                        # Log scale for most of the figures
+  edge_damping:                      # Boundary condition : to avoid artefacts, the field is damped at the edge with a sinus function. Edge damping sets the relative size of damping compared to simulation box. 0.25 corresponds to a damping from +-propsize to +-propsize/2.
+  - 0.25
+  edge_damping_shape: circular       # Shape of the edge damping. "circular" uses a sinus function for damping.
+  flow:                              # Parameters of the flow plots saved. Flow planes are saved in this example from -4.2 meter, to +4.2 meter, every 0.01 meter.
+  - -4.2
+  - 4.2
+  - 0.01
+  flow_auto_save: 0                 # 0 : Not saving individual figures for each flow plane. 1 : Saving all individual figures for each flow plane (heavy).
+  flow_plot_gyax:                   # ylim parameters of the final flow_plot. In this example, the flow plot goes from  -650.0 um, to  650.0 um with a resolution of 1 um.
+  - -650.0
+  - 650.0
+  - 1.0
+  flow_plot_clim:                   # flow_plot colorbar limits. Defined in relative intensity.
+  - 1e-11
+  - 50
