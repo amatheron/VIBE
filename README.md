@@ -51,43 +51,45 @@ If you use **VIBE** in your work, please cite the software as:
 
 
 ---
+## Code structure
 
+```text
 VIBE/
 ├── src/
 │   └── vibe/
-│       ├── VIBE.py                # Main simulation engine
-│       ├── utils.py               # Generic utilities
-│       ├── bash_config.py         # HPC / batch job helpers
-│       ├── mmmUtils_v2.py          # Numerical & optical helper routines
-│       ├── wavefront_fitting.py   # Wavefront analysis tools
-│       ├── regularized_propagation_v2.py
-│       ├── rossendorfer_farbenliste.py
-│       ├── optical_constants/
-│       │   ├── Be.txt
-│       │   └── diamond.txt
-│       └── Dabam2D/                # 2D surface-defect maps (mirrors / optics)
+│       ├── VIBE.py                       # Main simulation engine
+│       ├── utils.py                      # Generic utilities
+│       ├── bash_config.py                # HPC / batch job helpers
+│       ├── mmmUtils_v2.py                # Numerical & optical helper routines
+│       ├── wavefront_fitting.py          # Wavefront analysis tools
+│       ├── regularized_propagation_v2.py # Regularized propagation tool
+│       ├── rossendorfer_farbenliste.py   # Ploting custom colormaps
+│       ├── optical_constants/            # Folder containing refractive index data for all used materials, from https://henke.lbl.gov/optical_constants/getdb2.html
+│       │   ├── Be.txt                    # Refractive indices for Beryllium in a certain energy range (can be updated if necessary).
+│       │   └── diamond.txt               # Refractive indices for Diamond in a certain energy range (can be updated if necessary).
+│       └── Dabam2D/                      # 2D surface-defect maps (mirrors / optics)
 │
-├── VIBE_outputs/                   # All simulation outputs and diagnostics
-│   ├── figures/
-│   ├── flows/
-│   ├── pickles/
-│   ├── planes/
-│   ├── Lens_diags/
-│   └── VB_figures/
+├── VIBE_outputs/                  # All simulation outputs and diagnostics
+│   ├── figures/                   # Mosaic figures with all interest planes for all channels
+│   ├── flows/                     # Flow plots = side views / waterfall like plots
+│   ├── pickles/                   # Simulation pickle. Warning : can be heavy.
+│   ├── planes/                    # Individual ploted planes
+│   ├── Lens_diags/                # Lens diagnostics. Ideal parabollic profiles and defects (via DABAM 2D)
+│   └── VB_figures/                # Interaction plane distribution of pump, probe and signal
 │
-├── notebooks/                      # Example notebooks
-├── yamls/                          # YAML-based simulation templates
-├── docs/                           # Documentation assets (logo, figures)
-└── pyproject.toml                  # Packaging and dependencies
-
+├── notebooks/                     # Example notebooks
+├── yamls/                         # Example YAML file = simulation input file
+├── docs/                          # Documentation assets (logo, figures)
+└── pyproject.toml                 # Packaging and dependencies
+```
 ---
 
-## Simulation workflow (what `main_VIBE` does)
+## Simulation workflow (how the code operates)
 
 `main_VIBE(params, elements)` orchestrates the entire run:
 
 1. **Initialization**  
-   - Creates a LightPipes field with a Gaussian source (`Begin`, `GaussBeam`) using `propsize`, `wavelength`, `N`, beam size and tilts from YAML.  
+   - Creates a LightPipes field with a given source shape (Gaussian, Super-Gaussian, Flat-top, Experimental map etc...).
    - Wraps the field in a **FieldBundle** so additional channels (VB∥, VB⊥) can be carried transparently. The bundle also holds the current **z-position** and flags for **regularized propagation**.
 
 2. **Book-keeping & plotting setup**  
@@ -97,11 +99,11 @@ VIBE/
    For each element `(z, name, dict)`:
    - **Propagate** the bundle by `Δz` via FFT Fresnel or regularized propagation. Pixel size and physical window are updated after each hop.  
    - **Apply** the element to **every active channel** in the bundle (`main`, `VB∥`, `VB⊥`) using `apply_element(...)`.  
-   - **Create VB channels at TCC (once):** if `name=='TCC'` and `VB_signal: 1`, build VB masks from the IR intensity map and spawn VB∥/VB⊥ fields via masked multiplication.  
+   - **Create VB channels at Interaction plane (called TCC) (once):** if `name=='TCC'` and `VB_signal: 1`, build VB masks from the IR intensity map and spawn VB∥/VB⊥ fields via masked multiplication.  
    - **Compute intensities** per channel, in requested units, and generate per-plane plots/snapshots. For flows, the Y-axis unit and colorbar label adapt to the selected intensity unit; photon scaling is applied consistently to raw and fixed grids.
 
 4. **Outputs**  
-   - Returns updated `params`, a transmission trace, and a dict of figures for saving/export. Flow panels can annotate **shadow factors** (SFA13/SFA75) and mark the detector ROI.
+   - Returns updated `params`, a transmission trace, and a dict of figures for saving/export.
 
 ---
 
@@ -119,115 +121,110 @@ VIBE/
 - **`get_aperture_transmission_map(...)`** builds **binary/analytic transmission maps** for simple shapes (`square`, `rectangle`, `wire`, **`gaussian` blocker**) including super-Gaussian order.  
 - **`get_aperture_thickness_map(...)`** builds **thickness maps** for **refractive elements** and complex “wire-like” obstacles (`parabolic_lens`, `streichlens`, `realwire`, `trapez`, `tent`, `par`, `invpar`, `wireslit`, `wire_grating`, etc.), plus orientation and randomization hooks.  
 - **`doap(...)`** converts thickness to **transmission** and **phase** maps via δ, β and applies optional profiling, rotation, and diagnostic plotting (1D cuts and 2D views).  
-- **`do_phaseplate(...)`** adds **measured CRL defect maps** (Seiboth/Celestre) scaled to the number of lenses and selected material; returns a phase-shift map to apply.  
-- **`do_edge_damping_aperture(...)`** creates smooth apodizers to suppress wrap-around/edge artefacts late in the line.
+- **`do_edge_damping_aperture(...)`** creates smooth apodizers to suppress wrap-around/edge artefacts when the field is close to the boundaries of the box.
 
-### Element application & regularized propagation
+### Element application 
 - **`apply_element(bundle, el_name, el_dict, params, reg_prop_dict, ...)`** is the **central dispatcher** that:
   - iterates over active channels;
-  - supports **zoomed resampling** (`zoom_window`), **regularize/deregularize** (`reg`, `dereg`, `reg-by-f` thin-lens compensation), and
   - applies **apertures/phaseplates** by multiplying intensity and/or phase maps.
 
 ### VB creation at TCC
-- **IR profile**: Two options exist — **Airy PSF** for a finite NA focus or a **2-D Gaussian** spot; both normalized to power and converted to **I [W cm⁻²]** given `P_peak` (from pulse energy or direct).  
+- **Pump laser profile**: Two options exist — **Direct FFT** for a Near-field profile, calculates the corresponding Far-field focal spot; **External map** to choose an experimental map to input for the pump laser; both normalized to power and converted to **I [W cm⁻²]** given `P_peak` (from pulse energy or direct).  
 - **Masks & channels**: Using the analytical prefactors (critical intensity `I_cr`, fine-structure constant and geometry), the code builds **VB∥** and **VB⊥** **intensity masks** at TCC and **spawns the new channels** by multiplying the main field. From that point on, **all channels propagate together**.
 
-### Air scattering (optional, at the detector)
-- **`apply_air_scattering_and_debug_plot(...)`** performs a **2-D convolution** of the image with a kernel constructed from **Geant4 particle hits** (either raw 2-D histogram or a **smoothed radial** kernel), with optional transmission scaling and identity-kernel checks. Shapes are transiently **cropped to odd** dimensions to optimize FFT convolution and then restored.  
-  Enable on the `Det` plane via YAML switches such as `AirScat: 1`, `use_symmetric_kernel`, `compute_transmission`, etc.
 
 ### Plotting & flows
 - **Per-plane figures**: phase or intensity per channel; configurable mosaic, zoom, log scaling.  
-- **Flow plots**: longitudinal waterfall of vertical cuts, with **unit-aware** colorbars (`photons` → “photons/m²”, else relative/W m⁻²) and profile overlays of the propagated box size. Detector and ROI are annotated; **shadow factors** can be printed on the panel.
+- **Flow plots**: longitudinal waterfall of vertical cuts, with **unit-aware** colorbars (`photons` → “photons/m²”, else relative/W m⁻²) and profile overlays of the propagated box size. Detector and ROI are annotated; **SNR** and **Number of signal and background photons** can be printed on the panel.
 
----
 
-## Units and normalization
-
-Set `intensity_units` in YAML:
-
-- `photons` → results and flows are scaled to **photons/m²** using the appropriate factors; total-photon integrals are computed consistently and compared to `photons_total` when available.  
-- `relative` → legacy normalized units (good for shape comparisons).  
-- For some debug paths the code also reports **W cm⁻²** when building the IR intensity.
-
----
-
-## Typical YAML sketch (abridged)
-
-```yaml
-# Beam & run
-wavelength: 1.415e-10        # ~8.766 keV
-N: 2048
-propsize: 5.0e-3
-beamsize: 5.0e-6
-intensity_units: photons
-fig_rows: 2
-fig_cols: 3
-
-# Elements (unordered; Launch_VIBE sorts by position)
-elements:
-  start:
-    type: plane
-    position: 0.00
-    in: 1
-
-  TCC:
-    type: plane
-    position: 3.50
-    VB_signal: 1          # build VB channels here
-
-  L1:
-    type: parabolic_lens
-    position: 2.40
-    size: 400e-6
-    roc: 200e-6
-    num_lenses: 6
-    double_sided: true
-    elem: Be
-    in: 1
-
-  Det:
-    type: plane
-    position: 7.00
-    in: 1
-    AirScat: 1
-    use_symmetric_kernel: true
-```
-
----
-
-## Running a simulation
-
-1. **Install** (Python ≥3.9 recommended)
+## Install VIBE from scratch and run a simulation
+1. **Cloning the VIBE repository** 
+   Clone the VIBE repository :
+   ```bash
+   git clone https://github.com/amatheron/VIBE.git
+   cd VIBE
+   ```
+   
+2. **Environment preparation** (Micromamba recommended)
+   We recommend the use of a micromambda environment, a particularly clean, light and easy solution for HPC simulations. Note however that VIBE will also run on any other (recent) python environment.
+   
+   When micromamba is available on the machine, initialize the shell support :
+   ```bash
+   micromamba shell init -s bash -p ~/micromamba
+   source ~/.bashrc
+   ```
+   Then create a dedicated VIBE environment :
+   ```bash
+   micromamba create -n vibe python=3.10 -y
+   ```
+   and activate the environment :
+   ```bash
+   micromamba activate vibe
+   ```
+3. **Installing VIBE** 
+   Install the VIBE repository using the pyproject.toml file :
+   ```bash
+   pip install -e .
+   ```
+   This command will install VIBE, resolve all dependencies automatically from pyproject.toml and install optional plotting backends.
+   
+   You can verify that the installation worked well with :
 
    ```bash
-   pip install lightpipes numpy scipy matplotlib astropy pillow scikit-image
+   python - << EOF
+   import vibe
+   print("VIBE successfully installed")
+   EOF
    ```
+ 4. **Run the first example simulation**
 
-   If you plan to use air-scattering and flows, keep `darkfield/*` available on `PYTHONPATH`.
+    Try to run the first example simulation. The corresponding yaml file is /VIBE/yaml/Simulation_example_1.yaml
 
-2. **Launch**
+    An automatic bash script has been written to help with job submission. This bash script is handled by /VIBE/src/vibe/bash_config.py.
+    The file bash_config.py **must be updated to fit your HPC requirements.**
 
-   ```bash
-   python Launch_VIBE.py --yaml path/to/your_config.yaml
-   ```
+    When updated, open the template Notebook /VIBE/notebooks/RUN_vibe_example.ipynb and execute :
+    ```bash
+    import os
+    from vibe.bash_config import write_bash
+    ```
+    and,
+    ```bash
+    upd_params = {
+        'n_cpus': 24,
+        'mem': '600GB',
+        'yaml': 'Simulation_example_1.yaml'
+    }
+    
+    bash_path = write_bash("bash", 300, upd_params)
+    print("Generated:", bash_path)
+    ```
+    to run the first simulation.
 
-   The script will print a summary of parameters, then generate per-plane figures, a flow panel, and optional movie frames/exports depending on your YAML switches.
+    Check if the simulation logs in VIBE/bash/bash_output/Simulation_example_1.log and VIBE/bash/bash_output/Simulation_example_1.err.
 
+    
 ---
 
-## Tips & switches
+## Input yaml file description :
 
-- **Regularized propagation**: use `reg`, `dereg`, or `reg-by-f` elements to stabilize long propagation spans with parabola compensation; the propagation mode toggles automatically in the loop.  
-- **Edge damping**: enable `edge_damping` to apply a smooth apodizer and reduce ringing/aliasing.  
-- **Henke tables**: ensure `optical_constants/<Elem>.txt` exists for all materials referenced in YAML (`elem:`).  
-- **Photon accounting**: set `photons_total` in YAML if you want the flow integrals to be checked against a target value near the beam shaper.
+**Two examples of yaml input files can be found in /VIBE/yaml/** :
+- **"Simulation_example_1.yaml"** is a simple simulation corresponding to the geometry used in Figure 2 of the paper. It simulates a simple flat-top probe beam colliding a Gaussian like pump at z = 0.
+- **"Simulation_definitions.yaml"** is a complete file containing all possible options to include into an input file. Note that this file obviously does not run on its own since some options contradict each other. This is made to serve as a reference for yaml file writing on VIBE.
 
----
+**Description of some blocks of yaml file :**
 
-## How the VB feature works
+- **"beam_shaper"** serves as a reference for the total number of photons of the probe, as well as the shape of the initial probe beam. The code will make sure that the number of photons defined in Xbeam/photons_total is met at the beam_shaper position (therefore scalling the full simulation field by a factor "scale_ph"). In addition, this plane can be defined as an aperture to shape the beam to whatever geometry. For flat-top and Gaussian geometry, the "Super-Gaussian" formula is used, where the lineout shape $f(x)$ is expressed as :
+$f(x) = f_0 \exp \left( -\left(\frac{x^2}{2\sigma^2} \right)^P\right)$,
+with $P$ the order of the gaussian, set in the code with the option "power" (power = 1 corresponds to a standard Gaussian, and power > 6 correspond to profiles very close to flat-top beams), and $\sigma = \frac{FWHM}{2\sqrt{2} \ln(2)^{1/(2P)}}$, the "rms" size of the Super-gaussian, meeting the regular definition for a Gaussian, and getting close to the full diameter of the flat-top beam for P>6. In the code, the beam size corresponds to the FWHM (in intensity) and is indicated by the variable "size".
 
-At **TCC**, the IR pump profile is synthesized as a 2-D **Airy** or **Gaussian** intensity map and converted to **W cm⁻²** using `P_peak` (computed from pulse energy or set directly). Using the standard analytical prefactor (`I_cr`, fine-structure constant, geometry), the code builds two **unitless masks** for **VB∥** and **VB⊥**. Multiplying these masks with the **main** X-ray field **spawns** the two VB channels in the **FieldBundle**. From there, the **same propagation** and **same element stack** apply to all channels, so VB is carried all the way to the detector.
+ 
+- **"Custom_CRL"** allows to simulate a Compound Refractive Lens (CRL) stack using the standard equations. The CRL is defined with :
+  A parabolic shape on each side such that their total thickness can be written : $\Delta_z(x,y) = \frac{x^2+y^2}{ROC}$ for $\sqrt{x^2+y^2}<A$ and $\Delta_z(x,y)=L$ for $\sqrt{x^2+y^2}>A$. The lens geometric aperture $A$ is linked to the radius of curvature $ROC$ and apex thickness $t_{wall}$ by $A=2\sqrt{ROC(L-t_{wall})}$. The total focal length of the stack is defined as : $f=\frac{ROC}{2N\delta}$ with $N$ the number of lenses in the stack and $delta$ the (x-ray defined) refractive index.
+In the code the Custom_CRL block is parametrised by  : ROC (radius of curvature), L (lens thickness), A (Lens geometric aperture), nb_lenses (the number of individual lenses in the stack) and lens_material, the material for the lens (only "diamond" and "Be" are implemented at the moment).
 
----
+ 
+
+
 
