@@ -1,23 +1,37 @@
-# ----------------------------
-# Runtime / generated content
-# ----------------------------
+# ==========================================
+# Local working files (not public)
+# ==========================================
+
+# --- Simulation outputs ---
 VIBE_outputs/**
 !VIBE_outputs/**/.gitkeep
 
-bash/bash_output/**
-bash/.ipynb_checkpoints/**
-.ipynb_checkpoints/**
+# --- YAML parameter files ---
+yamls/**/*.yaml
+yamls/**/*.yml
 
+# --- Jupyter notebooks ---
+notebooks/**/*.ipynb
+notebooks/**/.ipynb_checkpoints/**
+
+# --- Bash outputs ---
+bash/bash_output/**
+
+# ==========================================
+# Python / runtime
+# ==========================================
 __pycache__/
 *.pyc
+src/*.egg-info/
 
-# Jupyter
-.ipynb_checkpoints
+# ==========================================
+# Jupyter (global safety)
+# ==========================================
+.ipynb_checkpoints/**
 
-# SLURM
+# ==========================================
+# SLURM / cluster outputs
+# ==========================================
 *.out
 *.err
 *.log
-
-bash/
-src/*.egg-info/
