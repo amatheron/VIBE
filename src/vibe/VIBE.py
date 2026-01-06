@@ -1599,6 +1599,7 @@ def doap(pars,params=[],debug=0,return_thickness=0):
             print('max phaseshift = ',np.max(phaseshiftmap))
             print('min phaseshift = ',np.min(phaseshiftmap))
 
+
     if 0:
         plt.sca(axap)
         lab=pars['shape']+", {:.0f} μm".format(pars['size']/um)
@@ -1621,6 +1622,34 @@ def doap(pars,params=[],debug=0,return_thickness=0):
         plt.ylabel('phase shift [rad]')
 
         plt.xlabel('position [μm]')
+
+    # ─── Apply transverse offsets if requested ───
+    shift_x_um = float(pars.get("offset_x_um", 0.0))
+    shift_y_um = float(pars.get("offset_y_um", 0.0))
+
+    if shift_x_um != 0.0 or shift_y_um != 0.0:
+        dx = shift_x_um * 1e-6 / params["pxsize"]
+        dy = shift_y_um * 1e-6 / params["pxsize"]
+
+        print(f"[APERTURE] Shifting map by dx={shift_x_um:.1f} µm, dy={shift_y_um:.1f} µm")
+
+        transmissionmap = imshift(
+            transmissionmap,
+            shift=(dy, dx),
+            order=1,
+            mode='constant',
+            cval=1.0
+        )
+
+        phaseshiftmap = imshift(
+            phaseshiftmap,
+            shift=(dy, dx),
+            order=1,
+            mode='constant',
+            cval=0.0
+        )
+
+
 
     if axap!=None:# and pars['shape']!='circle':
         plt.sca(axap)

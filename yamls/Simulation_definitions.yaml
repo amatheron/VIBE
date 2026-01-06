@@ -9,6 +9,8 @@ beam_shaper:                         # Beam shaper object : shapes the initial p
   invert: 0                          # Inversion (if =1 the minimum transmission is at the center)
   power: 20                          # Super-Gaussian power. >6 is very close to a flat-top beam. 1 = gaussian shape
   size: 0.0002                       # FWHM size (in intensity) in [m]
+  offset_x_um: 30                    # Horizontal offset of the beam center, in [um], in the general case.
+  offset_y_um: 0                     # Vertical offset of the beam center, in [um], in the general case.
   
 beam_shaper:                         # Beam shaper object : shapes the initial probe beam
   position: -10                      # Plane position [m]  
@@ -19,8 +21,8 @@ beam_shaper:                         # Beam shaper object : shapes the initial p
   center_sigma_px: 2.0               # Only used if center: "max". If so, it smoothes the external map with a typical sigma pixel (low pass filter) to avoid selecting the maximum corresponding to a hot-spot of the external image.
   calibration: 0.738188976           # If > 0, calibration in μm/pixel of the external image. If = 0 then the beam FWHM is taken to be equal to the "size" value of this section.
   size: 0.000140                     # Only used if calibration = 0 (ignored when calibration > 0). Size (FWHM in intensity) of the beam.
-  x_offset_um: 0.0                   # Horizontal offset of the beam center, in [um]
-  y_offset_um: 0.0                   # Vertical offset of the beam center, in [um]
+  x_offset_um: 0.0                   # [Offset only in the case of an external map] Horizontal offset of the beam center, in [um]
+  y_offset_um: 0.0                   # [Offset only in the case of an external map] Vertical offset of the beam center, in [um]
 
 reg1:                                # Regularisation object : regularises the propagation of the beam.
   in: 0                              # If = 1 the object is applied. If = 0 it is bypassed
