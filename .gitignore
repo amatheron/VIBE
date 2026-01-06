@@ -7,8 +7,7 @@ VIBE_outputs/**
 !VIBE_outputs/**/.gitkeep
 
 # --- YAML parameter files ---
-yamls/**/*.yaml
-yamls/**/*.yml
+yamls/**
 !yamls/Simulation_definitions.yaml
 !yamls/Simulation_example_1.yaml
 
