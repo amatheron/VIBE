@@ -1036,8 +1036,26 @@ def get_aperture_transmission_map(pars, params={}, debug=0):
         P = float(pars.get('power', 2)) # order of super-Gaussian
         sigma = fwhm / (2 * np.sqrt(2) * (np.log(2))**(1 / (2 * P))) # Wikipedia definition of Super Gaussian profile
         trmap = np.exp( - ( (r2 / (2 * sigma**2)) ** P ) )
+
+    elif typ == 'doublegaussian':
+        r2 = xm**2 + ym**2
+        fwhm1 = float(pars['size'])       # narrow Gaussian FWHM
+        fwhm2 = float(pars['size2'])      # wide Gaussian FWHM
+        ratio = float(pars.get('ratio', 1e-3))
+        P = float(pars.get('power', 2))
+        if ratio < 0:
+            raise ValueError("doublegaussian: 'ratio' must be >= 0")
+        # Convert FWHM → sigma
+        sigma1 = fwhm1 / (2 * np.sqrt(2) * (np.log(2))**(1 / (2 * P)))
+        sigma2 = fwhm2 / (2 * np.sqrt(2) * (np.log(2))**(1 / (2 * P)))
+        g1 = np.exp(-((r2 / (2 * sigma1**2)) ** P))
+        g2 = np.exp(-((r2 / (2 * sigma2**2)) ** P))
+        trmap = (g1 + ratio * g2) / (1.0 + ratio)
+        trmap = np.clip(trmap, 0.0, 1.0) # Numerical safety
+        
     else:
         raise ValueError(f"Unknown aperture shape: {typ}")
+
     # Invert transmission if needed
     if yamlval('invert', pars):
         trmap = 1 - trmap
@@ -1540,7 +1558,7 @@ def doap(pars,params=[],debug=0,return_thickness=0):
     N2 = int(N/2)
     typ = pars['shape']
 
-    if typ in ['square','rectangle','wire','gaussian']:
+    if typ in ['square','rectangle','wire','gaussian','doublegaussian']:
         transmissionmap = get_aperture_transmission_map(pars,params,debug)
         phaseshiftmap = transmissionmap * 0
         thicknessmap = transmissionmap * 0
