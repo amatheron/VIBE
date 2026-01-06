@@ -7,8 +7,14 @@ VIBE_outputs/**
 !VIBE_outputs/**/.gitkeep
 
 # --- YAML parameter files ---
-yamls/**/*.yaml
-yamls/**/*.yml
+yamls/*.yaml
+yamls/*.yml
+
+# --- Keep only the reference YAML files ---
+!yamls/Simulation_definitions.yaml
+!yamls/Simulation_example_1.yaml
+
+
 
 # --- Jupyter notebooks ---
 notebooks/**/*.ipynb
