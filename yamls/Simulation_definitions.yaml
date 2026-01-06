@@ -15,7 +15,7 @@ beam_shaper:                         # Beam shaper object : shapes the initial p
 beam_shaper:                         # Beam shaper object : shapes the initial probe beam
   position: -6                       # Plane position [m]  
   type: aperture                     # Type of plane (aperture = blocks some part of the beam with a given profile)
-  shape: doublegaussian              # Double Gaussian shape : with one peaked gaussian shape at the center, and a wider one around.
+  shape: doublegaussian              # Double Gaussian shape : with one peaked gaussian shape at the center, and a wider one around
   invert: 0                          # Inversion (if =1 the minimum transmission is at the center)
   power: 20                          # Super-Gaussian power. >6 is very close to a flat-top beam. 1 = gaussian shape
   size: 0.0002                       # FWHM size (in intensity) of the peaked Gaussian, in [m]
