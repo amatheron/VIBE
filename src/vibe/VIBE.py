@@ -163,11 +163,41 @@ def run_from_yaml(yaml_path: str, N: int):
     print("Simulation finished.")
 
     # --- Optional cleanup with the function "cleanup_heavy_outputs" if the option "save_fig_and_pickle" is activated  ---
-    if not input_params.get("save_fig_and_pickle", 1):
-        print("[INFO] save_fig_and_pickle=0 → cleaning up heavy outputs …")
-        cleanup_heavy_outputs(Path(projectdir), yamlname)
+    #if not input_params.get("save_fig_and_pickle", 1):
+    #    print("[INFO] save_fig_and_pickle=0 → cleaning up heavy outputs …")
+    #    cleanup_heavy_outputs(Path(projectdir), yamlname)
+    #else:
+    #    print("[INFO] save_fig_and_pickle=1 → keeping figures and pickles.")
+
+    # ------------------------------------------------------------
+    # New policy:
+    #   save_pickle (default from old save_fig_and_pickle)
+    #   save_figures (default derived from old save_fig_and_pickle + save_individual_figures)
+    # ------------------------------------------------------------
+    save_pickle = int(input_params.get("save_pickle", input_params.get("save_fig_and_pickle", 1)))
+
+    save_figures = input_params.get("save_figures", None)
+    if save_figures is None:
+        # Backward compatible defaults:
+        # - if save_fig_and_pickle==1 -> keep everything (no cleanup)
+        # - if save_fig_and_pickle==0 -> keep nothing except npz (cleanup will remove most things)
+        if int(input_params.get("save_fig_and_pickle", 1)) == 1:
+            save_figures = ["individual", "flowplot", "overlay", "mosaic", "transmission", "lens", "vb"]
+        else:
+            save_figures = []
+            if int(input_params.get("save_individual_figures", 0)) == 1:
+                save_figures.append("individual")
+
+    # If user wants literally everything, skip cleanup (fast path)
+    keep_all = (set([s.lower() for s in save_figures]) >= set(["individual","flowplot","overlay","mosaic","transmission","lens","vb"])
+                and save_pickle == 1)
+
+    if keep_all:
+        print("[INFO] keeping all figures and pickles (save_figures=ALL, save_pickle=1).")
     else:
-        print("[INFO] save_fig_and_pickle=1 → keeping figures and pickles.")
+        print(f"[INFO] cleanup policy: save_pickle={save_pickle}, save_figures={save_figures}")
+        cleanup_heavy_outputs(Path(projectdir), yamlname, save_pickle=save_pickle, save_figures=save_figures)
+
 
     return out_params, trans, figs
 
@@ -289,6 +319,9 @@ def build_input_params(cfg: dict, *, N: int, projectdir: str, filename: str) -> 
         "ax_apertures": None,
 
         # ---- optional flow/figs controls ----
+        "save_pickle":  yamlval("save_pickle",  S, None),   # None means "use legacy save_fig_and_pickle"
+        "save_figures": yamlval("save_figures", S, None),   # None means "use legacy defaults"
+        
         "figs_to_save":   yamlval("figs_to_save", S, []),
         "figs_to_export": yamlval("figs_to_export", S, []),
         "figs_log":       yamlval("figs_log", S, 1),
@@ -361,13 +394,9 @@ def sort_elements(elements, debug=0):
     return elements_sorted
 
 
-
+"""
 def cleanup_heavy_outputs(projectdir: Path, filename: str):
-    """
-    In the case where the option "save_fig_and_pickle" is deactivated in the yaml file,
-    deletes heavy figure and pickle outputs after flow_plot has run.
-    Keeps only the lightweight .npz summary produced by flow_plot.
-    """
+
     import glob, os
 
     # Directories
@@ -407,6 +436,148 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str):
     else:
         print(f"[CLEANUP] No files found to remove for {filename}.")
 
+"""
+
+def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int = 1, save_figures=None):
+    """
+    Delete heavy outputs unless explicitly requested.
+
+    Parameters
+    ----------
+    projectdir : Path
+        VIBE_outputs directory
+    filename : str
+        YAML stem used as output filename
+    save_pickle : int
+        1 -> keep pickles, 0 -> remove pickles
+    save_figures : list[str] | None
+        List of figure categories to keep.
+        Supported tokens (case-insensitive):
+            - individual
+            - flowplot
+            - overlay
+            - mosaic
+            - transmission
+            - lens
+            - vb
+    """
+    import glob, os
+
+    # Normalize flags
+    keep = set()
+    if save_figures:
+        keep = {str(x).strip().lower() for x in save_figures if str(x).strip()}
+
+    keep_individual    = ("individual" in keep)
+    keep_flowplot      = ("flowplot" in keep)
+    keep_overlay       = ("overlay" in keep)
+    keep_mosaic        = ("mosaic" in keep)
+    keep_transmission  = ("transmission" in keep)
+    keep_lens          = ("lens" in keep)
+    keep_vb            = ("vb" in keep)
+    keep_pickle        = (int(save_pickle) == 1)
+
+    # Directories
+    figs_dir     = Path(projectdir) / "figures"
+    flow_dir     = Path(projectdir) / "flows"
+    lens_dir     = Path(projectdir) / "Lens_diags"
+    vb_dir       = Path(projectdir) / "VB_figures"
+    pickles_dir  = Path(projectdir) / "pickles"
+
+    patterns = []
+
+    # -----------------------------
+    # FIGURES (figures/ directory)
+    # -----------------------------
+    # "mosaic" bucket: main + VB_parr/perp
+    if not keep_mosaic:
+        patterns += [
+            str(figs_dir / f"{filename}_main.jpg"),
+            str(figs_dir / f"{filename}_VB_parr.jpg"),
+            str(figs_dir / f"{filename}_VB_perp.jpg"),
+        ]
+
+    # "transmission" bucket: summary
+    if not keep_transmission:
+        patterns += [str(figs_dir / f"{filename}_summary.jpg")]
+
+    # -----------------------------
+    # FLOWS (flows/ directory)
+    # -----------------------------
+    # flowplot bucket: *_flowplot_VB_* plus *_flowplot_main*
+    if not keep_flowplot:
+        patterns += [
+            str(flow_dir / f"{filename}_flowplot_VB_parr.jpg"),
+            str(flow_dir / f"{filename}_flowplot_VB_perp.jpg"),
+            str(flow_dir / f"{filename}_flowplot_main*"),
+        ]
+
+    # overlay bucket: anything like <filename>_*overlay*
+    # (your example: LP_965_overlay)
+    if not keep_overlay:
+        patterns += [
+            str(flow_dir / f"{filename}*overlay*"),
+        ]
+
+    # individual bucket:
+    # This is the only ambiguous one because I don't know your exact naming convention.
+    # Common conventions I’ve seen in VIBE are per-plane images stored in:
+    #   VIBE_outputs/planes/<yamlname>/
+    # or flows/<yamlname>_flow_####.png
+    #
+    # So here are safe defaults:
+    # - remove planes/<filename>/* if not keeping "individual"
+    # - remove flows/<filename>_flowfig_* and flows/<filename>_slice_* if you use those
+    planes_dir = Path(projectdir) / "planes" / filename
+    if not keep_individual:
+        patterns += [
+            str(planes_dir / "*"),
+            str(flow_dir / f"{filename}_flowfig*"),
+            str(flow_dir / f"{filename}_slice*"),
+        ]
+
+    # -----------------------------
+    # Lens/VB diagnostics folders
+    # -----------------------------
+    if not keep_lens:
+        patterns += [str(lens_dir / f"{filename}*")]
+
+    if not keep_vb:
+        patterns += [str(vb_dir / f"{filename}*")]
+
+    # -----------------------------
+    # Pickles
+    # -----------------------------
+    if not keep_pickle:
+        patterns += [
+            str(pickles_dir / f"{filename}_figs.pickle"),
+            str(pickles_dir / f"{filename}_res.pickle"),
+        ]
+
+    removed = []
+    for pat in patterns:
+        for file in glob.glob(pat):
+            try:
+                # Avoid trying to os.remove directories (e.g. planes_dir)
+                if os.path.isdir(file):
+                    # Remove directory contents but keep parent structure
+                    # You can switch to shutil.rmtree(file) if you prefer removing the folder too.
+                    for f2 in glob.glob(os.path.join(file, "*")):
+                        try:
+                            os.remove(f2)
+                            removed.append(f2)
+                        except Exception:
+                            pass
+                else:
+                    os.remove(file)
+                    removed.append(file)
+            except Exception:
+                pass
+
+    if removed:
+        print(f"[CLEANUP] Removed {len(removed)} files for {filename}. Kept figures={sorted(keep)} save_pickle={keep_pickle}")
+    else:
+        print(f"[CLEANUP] No files found to remove for {filename}. Kept figures={sorted(keep)} save_pickle={keep_pickle}")
 
 
 # =========================================================

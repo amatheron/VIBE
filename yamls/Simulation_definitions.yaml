@@ -235,8 +235,9 @@ IRLaser:                             # Pump beam properties. In this case the pu
 
 
 simulation:                          # General simulation parameters
-  save_fig_and_pickle: 1             # 1 : All figures and pickles are saved (can be heavy). 0 : Only the important figures (flow_plot) and a light "summary.npz" are saved.
-  save_individual_figures: 1         # 1 : Saving the individual figures in /VIBE/VIBE_outputs/planes (can be a bit heavy if the resolution is high). 0 : not saving individual figures.
+  save_pickle: 1                     # Pickle is saved. It contains all the informations (parameters and diags) of the simulation. [Can be very heavy].
+  save_figures: [individual, flowplot, overlay, mosaic, transmission, lens, vb]       # Name of the figures being saved.
+  individual_fig_log: 0              # If the individual figures (of the planes defined in the yaml file, except the flow planes) must be saved on linear [0] or log scale [1].
   intensity_units: photons           # 'photons' or 'relative'. Unit of the intensity displayed. For 'photons' the code makes sure that "photons_total" photons are at the beam_shaper plane. For 'relative', the first plane intensity maximum will be set to unity.
   beamdiv: 0.0001                    # Initial beam divergence in [rad]
   name: as_filename                  # Simulation name (used for Pickles and figures). If = "as_filename" it will take the same name as the yaml input file.
