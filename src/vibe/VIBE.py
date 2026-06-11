@@ -1335,7 +1335,7 @@ def get_aperture_thickness_map(pars,params=[],debug=0):
                 sel=blade>horprof
                 horprof[sel]=blade[sel]
                 thicknessmap[:,i]=horprof
-    wls=['realwire','trapez','tent','customwire','pooyan','invpoo','invpar','par','wireslit','linearslit','wire_grating','wireslitup','wireslitdown']
+    wls=['realwire','trapez','tent','customwire','pooyan','invpoo','invpar','par','wireslit','linearslit','wire_grating','wireslitup','wireslitdown','sharp_slit','smooth_slit']
 
     if typ in wls :
         wireprof = get_wire_like_profile(pars,params,debug) #get the 1D transmission profile
@@ -1662,7 +1662,39 @@ def get_wire_like_profile(pars,params,debug):
 
     elif typ.find('realwire')==0: #round wire
             wireprof=(r**2-(Na-off)**2)**0.5*2
-            
+
+    elif typ == 'sharp_slit':
+        # Vertical slit with sharp edges. Bulk material of thickness `thickness`
+        # everywhere, except a clear opening of width `size` centered on the
+        # 1D profile. Material absorption is later applied via `elem`.
+        halfsize = float(pars['size']) / 2.0
+        th = float(pars['thickness'])
+        wireprof = np.full_like(x, th)
+        wireprof[np.abs(x) < halfsize] = 0.0
+
+    elif typ == 'smooth_slit':
+        # Same as sharp_slit, but the inner edges of the bulk material protrude
+        # into the slit with a half-elliptical "apex". The apex extends
+        # `apex_height` laterally into the slit and spans the full `thickness`
+        # in z, so the local material thickness within the apex region follows
+        #   t(x) = thickness * sqrt(1 - ((|x|-(halfsize-apex_h)) /
+        #                                (apex_h - 0))**2)   (rewritten below)
+        # When apex_height == thickness/2 the apex is a half-cylinder; smaller
+        # values give a flattened ovale; apex_height == 0 is identical to
+        # sharp_slit.
+        halfsize = float(pars['size']) / 2.0
+        apex_h   = float(pars.get('apex_height', 0.0))
+        th       = float(pars['thickness'])
+        wireprof = np.full_like(x, th)
+        # empty (open slit) zone: |x| < halfsize - apex_h
+        inner = halfsize - apex_h
+        wireprof[np.abs(x) < inner] = 0.0
+        if apex_h > 0:
+            sel = (np.abs(x) >= inner) & (np.abs(x) < halfsize)
+            # u = 0 at x = halfsize (bulk side), u = 1 at the apex tip
+            u = (halfsize - np.abs(x[sel])) / apex_h
+            wireprof[sel] = th * np.sqrt(np.clip(1.0 - u * u, 0.0, 1.0))
+
     elif typ=='mist':
         maxi=r*2*np.sqrt(2)
         wireprof=maxi-2*np.abs(x)
@@ -3541,201 +3573,305 @@ def flow_savefig(I, out_dir, idx, propsize, label, position,
     plt.savefig(out_zoom)
 
 
-
 # =========================================================
-# Air scattering related functions
+# Air_layer element
+# =========================================================
+#
+# Physical model
+# --------------
+# Geant4 simulates a monoenergetic point source of x-rays (no divergence)
+# that traverses `thickness` meters of air (after a thin Kapton window) and
+# lands on a virtual screen.  The output file stores per-photon (x, y, e):
+#
+#     data["x"], data["y"]   particle hit positions on the screen [µm]
+#     data["e"]              particle energies on the screen      [keV]
+#
+# Because the source is a point, this distribution is the spatial impulse
+# response of the air — i.e. a *Point Spread Function* (PSF).  The
+# total energy-weighted count divided by the number of primaries gives the
+# overall air transmission factor T_air.  The PSF is rotationally symmetric
+# in expectation, so we estimate it via azimuthal averaging (much higher
+# statistics than the raw 2D histogram).
+#
+# We then apply it to the LightPipes field as an incoherent transformation:
+#       I_new(x,y) = T_air * (I_old ∗ PSF)(x,y)
+#       F.field   <- sqrt(I_new) * exp(i * arg(F.field))
+# i.e. the intensity is convolved with the PSF and rescaled by T_air, while
+# the phase is preserved so that downstream coherent propagation remains
+# meaningful for the (dominant) ballistic component.
 # =========================================================
 
-def build_symmetric_kernel_from_particles(x_particles, y_particles, e_particles, Initial_energy_Geant4, N, propsize, nbins=401, smooth_sigma=4.0, plot_debug=False):
-    
+
+def _parse_n_primaries_from_filename(path):
     """
-    Build a smooth, rotationally symmetric scattering kernel from Geant4 particle hits.
+    Extract the number of primaries from a Geant4 stats filename.
 
-    Parameters:
-    - x_particles, y_particles: arrays of particle hit positions [µm]
-    - N: output resolution (LightPipes grid)
-    - propsize: LightPipes physical window size [m]
-    - nbins: number of radial bins
-    - smooth_sigma: Gaussian filter sigma (in bins)
-    - log_bins: if True, use logarithmic binning to better resolve the center
-    - plot_debug: plot radial profile and final kernel if True
+    Accepts variants such as:
+        xray_Primaries2e9_50umKapton_Air_stats.npz
+        Primaries_2.1e9_1m_Air.npz
+        Primaries-2.15e9_onlyAir.npz
+        primaries 1e8 vacuum.npz
 
-    Returns:
-    - kernel_2D: (N x N) normalized scattering kernel
+    The matcher is case-insensitive and tolerates an optional separator
+    (``_``, ``-``, space) between the word ``Primaries`` and the number.
+    Returns float or None if not found.
     """
-    
-    # Compute the radius of each particle
-    r_particles = np.sqrt(x_particles**2 + y_particles**2)   # in [um]
-    
-    # Convert propsize [m] to micrometers
-    half_size_um = propsize * 1e6 / 2
-    r_max = 2**0.5 * half_size_um
+    m = re.search(r"Primaries[_\-\s]*([\d.]+(?:e[+-]?\d+)?)",
+                  str(path), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
 
-    # Filter particles within the simulation window
-    valid = r_particles <= r_max
-    r_particles = r_particles[valid]
-    e_particles = e_particles[valid]
-    
-    # Step 2: define bins
-    r_bins = np.linspace(0, r_max, nbins + 1) # in [um]
 
-    Energy_weights_radial = e_particles / Initial_energy_Geant4  # only keep weights for selected particles
-    radial_hist, _ = np.histogram(r_particles, bins = r_bins, weights = Energy_weights_radial)
+def build_air_layer_psf(x_um, y_um, e_keV, E0_keV, N, propsize,
+                        n_radial_bins=600, smooth_sigma=2.0,
+                        n_keep_unsmoothed=3):
+    """
+    Build a normalized rotationally-symmetric PSF (sum = 1) on the simulation
+    grid from a Geant4 air-scattering particle list.
 
-    bin_areas = np.pi * (r_bins[1:]**2 - r_bins[:-1]**2) #in [um^2]
-    radial_density = radial_hist / bin_areas  # [particles / µm²]
-    
-    # Smoothing part
-    if smooth_sigma is None or smooth_sigma == 0:
-        radial_density_smooth = radial_density.copy()
+    Statistics are improved by azimuthal averaging: we histogram particle
+    radii (energy-weighted), divide by annulus area to get a radial density,
+    smooth the tail, then resample onto the 2D grid using a sub-pixel-aware
+    coordinate axis (so even N is handled correctly: the geometric center
+    sits between four pixels rather than on one).
+
+    Returns
+    -------
+    kernel : (N, N) ndarray, sum normalized to 1
+    r_centers : 1D ndarray, bin centers [µm]
+    density   : 1D ndarray, smoothed radial density [arb. units / µm²]
+    """
+    pxsize_um = propsize * 1e6 / N
+    half_size_um = propsize * 1e6 / 2.0
+    r_max_um = np.sqrt(2.0) * half_size_um
+
+    # --- energy-fraction weights (so a high-E photon counts more) ---
+    w = np.asarray(e_keV, dtype=float) / float(E0_keV)
+    r = np.sqrt(np.asarray(x_um, dtype=float)**2 +
+                np.asarray(y_um, dtype=float)**2)
+
+    sel = r <= r_max_um
+    r = r[sel]
+    w = w[sel]
+
+    # --- Separate the ballistic / quasi-unscattered photons (r < pxsize/2)
+    # from the scattered halo.  This is essential because for even N no
+    # pixel sits exactly at the geometric origin, and a delta-like central
+    # contribution would otherwise be lost when interpolating a radial
+    # density.  The ballistic weight is later painted onto the central
+    # pixel(s) with bilinear sub-pixel weights.
+    r_ball_cut = 0.5 * pxsize_um
+    ball_mask = r < r_ball_cut
+    w_ball = float(w[ball_mask].sum())
+    r = r[~ball_mask]
+    w = w[~ball_mask]
+
+    # --- radial bin edges: a few uniform bins near 0, log-spaced thereafter ---
+    r_inner_max = max(pxsize_um, 1.0)               # ~1 pixel scale near center
+    n_inner = 6
+    r_inner = np.linspace(0.0, r_inner_max, n_inner + 1)
+    r_outer = np.geomspace(r_inner_max, r_max_um,
+                           max(n_radial_bins - n_inner, 8))
+    r_bins = np.unique(np.concatenate([r_inner, r_outer]))
+
+    if r.size > 0:
+        hist, _ = np.histogram(r, bins=r_bins, weights=w)
     else:
-        n_unsmoothed = 1 # Number of points to exclude from smoothing
-        tail_smoothed = gaussian_filter1d(radial_density[n_unsmoothed:], sigma=smooth_sigma) # Create a smoothed version of the tail of the profile
-        radial_density_smooth = np.concatenate([ radial_density[:n_unsmoothed], tail_smoothed]) # Concatenate unsmoothed + smoothed parts
+        hist = np.zeros(len(r_bins) - 1)
+    bin_areas = np.pi * (r_bins[1:]**2 - r_bins[:-1]**2)         # [µm²]
+    bin_areas = np.where(bin_areas > 0, bin_areas, np.inf)
+    density = hist / bin_areas                                    # [w / µm²]
+
+    # --- smooth tail only (preserve narrow central peak) ---
+    if smooth_sigma and len(density) > n_keep_unsmoothed + 2:
+        tail = gaussian_filter1d(density[n_keep_unsmoothed:],
+                                 sigma=float(smooth_sigma))
+        density = np.concatenate([density[:n_keep_unsmoothed], tail])
+
+    # --- bin centers for interpolation ---
+    r_centers = 0.5 * (r_bins[:-1] + r_bins[1:])
+
+    # --- 2D kernel on grid centered at the geometric origin ---
+    # For even N this puts the origin between pixels (no special "center").
+    coord = (np.arange(N) - (N - 1) / 2.0) * pxsize_um
+    Xk, Yk = np.meshgrid(coord, coord, indexing="xy")
+    R = np.sqrt(Xk * Xk + Yk * Yk)
+
+    kernel = np.interp(R, r_centers, density,
+                       left=density[0], right=0.0)
+    kernel = np.maximum(kernel, 0.0)
+
+    # --- paint the ballistic delta onto the central pixel(s) with bilinear
+    # sub-pixel weights.  The origin lies at fractional index (N-1)/2 in
+    # each axis (== an integer for odd N, == half-integer for even N).
+    if w_ball > 0:
+        c = (N - 1) / 2.0
+        i0 = int(np.floor(c)); fx = c - i0
+        j0 = int(np.floor(c)); fy = c - j0
+        # equivalent density (weight/µm²) of a delta integrated over one pixel
+        delta_density = w_ball / (pxsize_um * pxsize_um)
+        wts = (((1 - fx) * (1 - fy), (j0,     i0    )),
+               ((    fx) * (1 - fy), (j0,     i0 + 1)),
+               ((1 - fx) * (    fy), (j0 + 1, i0    )),
+               ((    fx) * (    fy), (j0 + 1, i0 + 1)))
+        for wt, (jj, ii) in wts:
+            if wt > 0 and 0 <= jj < N and 0 <= ii < N:
+                kernel[jj, ii] += wt * delta_density
+
+    s = kernel.sum()
+    if s <= 0:
+        raise RuntimeError("[air_layer] PSF kernel sums to zero — "
+                           "check the Geant4 input file.")
+    kernel /= s
+    return kernel, r_centers, density
 
 
-    pixel_size_um = 2 * half_size_um / N
-    linspace_um = pixel_size_um * (np.arange(N) - N // 2)
-
-    X, Y = np.meshgrid(linspace_um, linspace_um)
-    R_grid = np.sqrt(X**2 + Y**2)
-    kernel_2D = np.interp(R_grid, r_bins[:-1], radial_density_smooth, left=0, right=0)
-
-    return kernel_2D, radial_hist, r_bins, radial_density , radial_density_smooth
-
-
-
-
-def apply_air_scattering_and_debug_plot(F, params, propsize, N, plot_debug = False, use_symmetric_kernel = False, compute_transmission = False, test_identity_kernel = False , crop_to_odd = True):
-
+def _resolve_air_layer_file(el_dict, params):
     """
-    Applies Geant4 air scattering to the LightPipes field via convolution.
-    
-    Parameters:
-    - F: LightPipes field object
-    - params: dict containing at least 'projectdir'
-    - propsize: field size in meters (LightPipes simulation window)
-    - N: number of pixels in LightPipes grid
-    - plot_debug: if True, show and save a comparison figure
-    - use_symmetric_kernel: if True, build rotationally symmetric smoothed kernel
-    
-    Returns:
-    - I_after_air: convolved intensity (2D numpy array)
+    Resolve the Geant4 .npz path.  Accepts an absolute path, a path relative
+    to the project parent dir, or falls back to the standard location used
+    by the legacy code.
     """
-    import time
-    start_time = time.time() #starts the timer
-    
-    basepath = Path(params["projectdir"]).parent
-    data = np.load(basepath / "Air_scattering/xray_Primaries2e9_50umKapton_Air_stats.npz")
-    x_particles = data["x"] # in um
-    y_particles = data["y"] # in um
-    e_particles = data["e"] # in keV
-    Initial_energy_Geant4 = 8.8 # in keV
-    
-    half_size_um = propsize * 1e6 / 2
+    g4 = el_dict.get("geant4_file", None)
+    base = Path(params.get("projectdir", ".")).parent
 
-    # Step 1: Force identity kernel first if requested
-    if test_identity_kernel:
-        kernel_2D = np.zeros((N, N))
-        kernel_2D[N // 2, N // 2] = 1.0
-        use_symmetric_kernel = 0  # Prevent rebuilding later
-        compute_transmission = 0  # Prevent scaling
+    if g4 is None:
+        return base / "Air_scattering" / "xray_Primaries2e9_50umKapton_Air_stats.npz"
 
-        
-    if use_symmetric_kernel:
-        kernel_2D, radial_hist, r_bins, radial_density , radial_density_smooth = build_symmetric_kernel_from_particles(
-            x_particles, y_particles, e_particles, Initial_energy_Geant4,  N = N, propsize = propsize,
-            nbins=1001, smooth_sigma=4.0, plot_debug=False)
-    else:
-        kernel_2D, _, _ = np.histogram2d(x_particles, y_particles, bins=N, range=[[-half_size_um, half_size_um], [-half_size_um, half_size_um]], 
-                                         weights = e_particles / Initial_energy_Geant4 )
-        radial_hist = radial_density = radial_density_smooth = None
-
-    I_lp = F    
-
-    # Step 2: Crop both kernel and image together, if needed
-    if crop_to_odd:
-        kernel_2D = croping_to_odd(kernel_2D)
-        I_lp = croping_to_odd(I_lp)
+    p = Path(g4)
+    if p.is_absolute():
+        return p
+    # try relative to parent of projectdir, then relative to projectdir
+    cand1 = base / p
+    if cand1.exists():
+        return cand1
+    return Path(params.get("projectdir", ".")) / p
 
 
-    if not test_identity_kernel:
-        kernel_2D /= np.sum(kernel_2D) #normalizing such that the sum is 1
-    
-        nb_particles_after_scattering = len(x_particles) # total number of particles ending on the screen after scattering
-        nb_primaries = 2e9 #number of primary particles (nb of particles intialised in the simulation)
+def apply_air_layer(F, el_dict, params, el_name="air_layer"):
+    """
+    Apply an `air_layer` element to a LightPipes field.
 
-        transmission_factor = nb_particles_after_scattering / nb_primaries #percentage of particles making it through
-    
-        if compute_transmission:
-            kernel_2D *= transmission_factor  # Take into account that some particles are absorbed by air
+    Convolves the field intensity with a Geant4-derived rotationally-
+    symmetric PSF, rescales by the air transmission factor T_air, and
+    rebuilds the complex field preserving the original phase.
 
-    I_after_air = fftconvolve(I_lp, kernel_2D, mode='same') #convolve the image with the Kernel
+    YAML keys
+    ---------
+    type            : 'air_layer'
+    position        : longitudinal location [m]
+    thickness       : nominal air thickness [m] (informational; selects the
+                      Geant4 file to use if `geant4_file` is not given)
+    geant4_file     : (optional) path to Geant4 .npz output
+    N_primaries     : (optional) number of primary photons in the Geant4 run
+                      (parsed from the filename if absent)
+    beam_energy_keV : (optional) initial photon energy used by Geant4
+                      (default 8.8 keV)
+    apply_transmission : 1/0, scale by T_air (default 1)
+    n_radial_bins   : kernel radial bins (default 600)
+    smooth_sigma    : tail smoothing sigma in bins (default 2.0)
+    plot_debug      : 1/0, save debug figure (default 0)
+    """
+    N        = params["N"]
+    propsize = params["propsize"]
 
-    I_after_air = restore_even_shape_by_duplication(I_after_air, (N, N)) # add back a line and a row to make it (NxN) again.
-    #I_lp = restore_even_shape_by_duplication(I_lp, (N, N)) # add back a line and a row to make it (NxN) again.
+    g4_path = _resolve_air_layer_file(el_dict, params)
+    if not g4_path.exists():
+        raise FileNotFoundError(f"[air_layer] Geant4 file not found: {g4_path}")
 
-    # Set the values outside the disk to 0 after the convolution
-    Ymask, Xmask = np.indices(I_after_air.shape)
-    rmask = np.sqrt((Xmask - N//2)**2 + (Ymask - N//2)**2)
-    mask = rmask <= (N//2)  # or a more precise radius
-    I_after_air[~mask] = 0
+    data = np.load(g4_path)
+    x_um  = data["x"]
+    y_um  = data["y"]
+    e_keV = data["e"]
 
-    if plot_debug:
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    E0_keV = float(el_dict.get("beam_energy_keV", 8.8))
 
-        axes[0, 0].scatter(x_particles, y_particles, s=1, alpha=0.3)
-        axes[0, 0].set_xlim(-half_size_um, half_size_um)
-        axes[0, 0].set_ylim(-half_size_um, half_size_um)
-        axes[0, 0].set_title("Geant4 raw scatter (scatter plot)")
-        axes[0, 0].set_xlabel("x [µm]")
-        axes[0, 0].set_ylabel("y [µm]")
-        axes[0, 0].grid(True)
-        axes[0, 0].set_aspect("equal")
+    # number of primary photons
+    n_prim = el_dict.get("N_primaries", None)
+    if n_prim is None:
+        n_prim = _parse_n_primaries_from_filename(g4_path)
+    if n_prim is None:
+        n_prim = 2e9
+        print(f"[air_layer] WARNING: could not infer N_primaries from "
+              f"{g4_path.name}; assuming {n_prim:.1e}.")
+    n_prim = float(n_prim)
 
-        if use_symmetric_kernel and r_bins is not None:
-            axes[0, 1].plot(r_bins[:-1], radial_density)
-            axes[0, 1].set_title("Radial histogram (nb particles at a given r / area)")
-            axes[0, 1].set_xlabel("r [µm]")
-            axes[0, 1].set_ylabel("Photons/area")
-            axes[0, 1].set_yscale('log')
-            axes[0, 1].grid(True)
+    # --- build PSF ---
+    kernel, r_centers, density = build_air_layer_psf(
+        x_um, y_um, e_keV, E0_keV, N, propsize,
+        n_radial_bins=int(el_dict.get("n_radial_bins", 600)),
+        smooth_sigma=float(el_dict.get("smooth_sigma", 2.0)),
+    )
 
-            axes[0, 2].plot(r_bins[:-1], radial_density_smooth)
-            axes[0, 2].set_title("Radial density smoothed (nb particles / area at a given r)")
-            axes[0, 2].set_xlabel("r [µm]")
-            axes[0, 2].set_ylabel("Photons/area")
-            axes[0, 2].set_yscale('log')
-            axes[0, 2].grid(True)
+    # --- air transmission factor (energy-weighted) ---
+    T_air = float(np.sum(e_keV) / (n_prim * E0_keV))
+    if not int(el_dict.get("apply_transmission", 1)):
+        T_air = 1.0
 
-        extent_um = [-half_size_um, half_size_um, -half_size_um, half_size_um]  # [µm]
-        
-        im3 = axes[1, 0].imshow(kernel_2D, cmap='inferno', norm=LogNorm(), extent=extent_um, origin='lower')
-        axes[1, 0].set_title("2D Geant4 kernel")
-        fig.colorbar(im3, ax=axes[1, 0])
-        
-        im4 = axes[1, 1].imshow(I_lp, cmap='inferno', norm=LogNorm(), extent=extent_um, origin='lower')
-        axes[1, 1].set_title("LightPipes Intensity")
-        fig.colorbar(im4, ax=axes[1, 1])
-        
-        im5 = axes[1, 2].imshow(I_after_air, cmap='inferno', norm=LogNorm(), extent=extent_um, origin='lower')
-        axes[1, 2].set_title("After convolution")
-        fig.colorbar(im5, ax=axes[1, 2])
-        
-        for ax in axes[1, :]:
-            ax.set_xlabel("x [µm]")
-            ax.set_ylabel("y [µm]")
+    # --- apply: I_new = T_air * (I_old * PSF), preserve phase ---
+    field = F.field
+    I_old = (field.real * field.real + field.imag * field.imag)
+    I_new = fftconvolve(I_old, kernel, mode="same")
+    I_new = np.maximum(I_new, 0.0) * T_air
 
-        plt.tight_layout()
-        plt.savefig(basepath / "AirScattering_DebugPanel_6plots.png", dpi=300)
-        plt.show()
+    amp   = np.sqrt(I_new)
+    phase = np.angle(field)
+    F.field = (amp * np.exp(1j * phase)).astype(field.dtype, copy=False)
 
-    elapsed_time = time.time() - start_time  # End timer
-    print(f"Air scattering + convolution took {elapsed_time/60:.2f} minutes.")
-    
-    return I_after_air
+    print(f"[air_layer] {el_name}: file={g4_path.name}, "
+          f"thickness={el_dict.get('thickness', 'n/a')} m, "
+          f"T_air={T_air:.4e}, N={N}, propsize={propsize*1e3:.2f} mm")
 
+    # --- optional debug figure ---
+    if int(el_dict.get("plot_debug", 0)):
+        try:
+            outdir = Path(params.get("projectdir", ".")) / "figures"
+            outdir.mkdir(parents=True, exist_ok=True)
+            tag = el_dict.get("element_name", el_name)
+            half_um = propsize * 1e6 / 2
+            ext = (-half_um, half_um, -half_um, half_um)
 
+            fig, ax = plt.subplots(2, 2, figsize=(11, 9))
+            # PSF (log)
+            k_floor = kernel.max() * 1e-12 + 1e-300
+            ax[0, 0].imshow(np.log10(kernel + k_floor), extent=ext,
+                            origin="lower", cmap="inferno")
+            ax[0, 0].set_title(f"PSF log10 (sum=1)")
+            ax[0, 0].set_xlabel("x [µm]"); ax[0, 0].set_ylabel("y [µm]")
+
+            # radial density
+            ax[0, 1].plot(r_centers, density)
+            ax[0, 1].set_xscale("log"); ax[0, 1].set_yscale("log")
+            ax[0, 1].set_xlabel("r [µm]"); ax[0, 1].set_ylabel("density [w/µm²]")
+            ax[0, 1].set_title("Smoothed radial density")
+            ax[0, 1].grid(True, which="both", alpha=0.3)
+
+            i_floor = max(I_old.max() * 1e-12, 1e-300)
+            ax[1, 0].imshow(np.log10(I_old + i_floor), extent=ext,
+                            origin="lower", cmap="inferno")
+            ax[1, 0].set_title("|F|² before")
+            ax[1, 0].set_xlabel("x [µm]"); ax[1, 0].set_ylabel("y [µm]")
+
+            j_floor = max(I_new.max() * 1e-12, 1e-300)
+            ax[1, 1].imshow(np.log10(I_new + j_floor), extent=ext,
+                            origin="lower", cmap="inferno")
+            ax[1, 1].set_title(f"|F|² after  (T_air={T_air:.3e})")
+            ax[1, 1].set_xlabel("x [µm]"); ax[1, 1].set_ylabel("y [µm]")
+
+            fig.suptitle(f"air_layer debug — {tag}")
+            fig.tight_layout()
+            fname = f"{params.get('filename', 'sim')}_{tag}_air_layer.png"
+            fig.savefig(outdir / fname, dpi=150)
+            plt.close(fig)
+            print(f"[air_layer] debug figure → {outdir / fname}")
+        except Exception as ex:
+            print(f"[air_layer] plot_debug failed: {ex}")
+
+    return F
 
 
 # =========================================================
@@ -4683,12 +4819,23 @@ def build_external_shaper_mask(el_dict: dict, F, params: dict) -> np.ndarray:
 
     # -- build intensity transmission so that (M * I_in) ∝ T (shape match)
     I_in = Intensity(0, F)
-    eps = 1e-300
-    M0 = T / (I_in + eps)                 # desired ratio in intensity units
-    mmax = float(np.nanmax(M0))
+    # NOTE: do the division in float64 and explicitly mask cells where I_in==0.
+    # The field is float32 (complex64 backing); a Python-float eps like 1e-300
+    # added to a float32 array underflows to 0 under NumPy >=2 (NEP 50), so the
+    # previous `T / (I_in + eps)` produced 0/0 = NaN in any cell where both T
+    # and I_in are exactly zero (e.g. corners where edge_damping forces the
+    # field to 0 and the source image does not extend). A single NaN cell is
+    # later smeared across the whole grid by Forvard's FFT, turning every
+    # downstream plane into all-NaN. See bug investigation notes.
+    I_in64 = np.asarray(I_in, dtype=np.float64)
+    T64    = np.asarray(T,    dtype=np.float64)
+    mask   = I_in64 > 0.0
+    M0 = np.zeros_like(I_in64)
+    np.divide(T64, I_in64, out=M0, where=mask)
+    mmax = float(np.nanmax(M0)) if M0.size else 0.0
     if not np.isfinite(mmax) or mmax <= 0:
         return np.zeros_like(I_in)
-    M = np.clip(M0 / mmax, 0.0, 1.0)      # cap so it's a *transmission* (≤1)
+    M = np.clip(M0 / mmax, 0.0, 1.0).astype(I_in.dtype, copy=False)
 
     return M
 
@@ -5626,7 +5773,61 @@ def apply_element(bundle: FieldBundle,
         if 'lens' in el_type:
             ideal = yamlval('ideal', el_dict, 1)
             if ideal:
-                f = el_dict['f']
+                # Allow specifying the focal length via a full FWHM convergence
+                # angle (in microradians) instead of an explicit `f`.
+                # Full convergence angle = beam_FWHM / f  (small-angle).
+                # The beam size used in the formula is taken from `beam_size_m`
+                # if provided (recommended, unambiguous), otherwise it is
+                # auto-measured as the intensity FWHM of the field at the lens
+                # plane (averaged over central row and column).
+                if 'full_fwhm_conv_angle_urad' in el_dict:
+                    angle_rad = float(el_dict['full_fwhm_conv_angle_urad']) * 1e-6
+                    if angle_rad == 0.0:
+                        raise ValueError(
+                            f"[{el_name}] full_fwhm_conv_angle_urad must be non-zero."
+                        )
+                    if 'beam_size_m' in el_dict:
+                        fwhm_beam = float(el_dict['beam_size_m'])
+                        f = fwhm_beam / angle_rad
+                        print(f"[{el_name}] beam_size_m={fwhm_beam*1e6:.2f} µm, "
+                              f"angle={el_dict['full_fwhm_conv_angle_urad']} µrad "
+                              f"=> f={f:.4f} m")
+                    else:
+                        I2D = Intensity(0, F)
+                        Ny, Nx = I2D.shape
+                        dx = propsize / Nx
+                        cx_row = I2D[Ny // 2, :]
+                        cy_col = I2D[:, Nx // 2]
+                        def _fwhm_pixels(line):
+                            m = np.nanmax(line)
+                            if not np.isfinite(m) or m <= 0:
+                                return None
+                            idx = np.where(line >= 0.5 * m)[0]
+                            if idx.size < 2:
+                                return None
+                            return (idx[-1] - idx[0]) * dx
+                        fwhm_x = _fwhm_pixels(cx_row)
+                        fwhm_y = _fwhm_pixels(cy_col)
+                        fwhms = [v for v in (fwhm_x, fwhm_y) if v is not None]
+                        if not fwhms:
+                            raise ValueError(
+                                f"[{el_name}] could not measure beam FWHM at lens plane "
+                                f"to derive f from full_fwhm_conv_angle_urad. "
+                                f"Provide `beam_size_m` explicitly."
+                            )
+                        fwhm_beam = float(np.mean(fwhms))
+                        f = fwhm_beam / angle_rad
+                        print(f"[{el_name}] auto FWHM(x,y)=("
+                              f"{(fwhm_x*1e6) if fwhm_x is not None else float('nan'):.2f},"
+                              f"{(fwhm_y*1e6) if fwhm_y is not None else float('nan'):.2f}) µm "
+                              f"-> using <FWHM>={fwhm_beam*1e6:.2f} µm, "
+                              f"angle={el_dict['full_fwhm_conv_angle_urad']} µrad "
+                              f"=> f={f:.4f} m  "
+                              f"(NOTE: auto-measured from current field; if the "
+                              f"beam is not yet shaped at this plane, set "
+                              f"`beam_size_m` explicitly.)")
+                else:
+                    f = el_dict['f']
                 if "reg" in el_type:
                     if reg_prop_dict["reg_parabola_focus"] is None:
                         reg_prop_dict["reg_parabola_focus"] = f
@@ -5801,6 +6002,45 @@ def apply_element(bundle: FieldBundle,
                         if yamlval('do_phaseshift',el_dict,1):
                             F = MultPhase(phasemap,F)
                             bundle.fields[ch_name] = F
+
+
+        ############# ELEMENT : AIR LAYER (Geant4-derived PSF) ###########
+        if el_type.lower() == "air_layer":
+            channels = el_dict.get("channels", list(bundle.fields.keys()))
+            if ch_name in channels:
+                F = apply_air_layer(F, el_dict, params, el_name=el_name)
+                bundle.fields[ch_name] = F
+
+
+        ############# ELEMENT : ABSORBER (uniform attenuator) ###########
+        # YAML:
+        #   MyAbs:
+        #     type: absorber
+        #     position: 1.23
+        #     transmission: 0.5         # intensity transmission (0..1)
+        #     # OR equivalently:
+        #     # OD: 0.301                # optical density, T = 10**-OD
+        #     channels: ["main"]        # optional; default = ALL channels
+        if el_type.lower() == "absorber":
+            channels = el_dict.get("channels", list(bundle.fields.keys()))
+            if ch_name in channels:
+                if "transmission" in el_dict:
+                    T = float(el_dict["transmission"])
+                elif "OD" in el_dict:
+                    T = 10.0 ** (-float(el_dict["OD"]))
+                else:
+                    raise ValueError(
+                        f"[absorber] '{el_name}' needs 'transmission' (0..1) "
+                        f"or 'OD' (optical density)."
+                    )
+                if not (0.0 <= T <= 1.0):
+                    raise ValueError(
+                        f"[absorber] '{el_name}' transmission={T} must be in [0, 1]."
+                    )
+                # Uniform intensity attenuation: I -> T * I  (amplitude *= sqrt(T))
+                F.field = F.field * np.sqrt(T)
+                bundle.fields[ch_name] = F
+                print(f"[absorber] {el_name}: T={T:.4g} applied to '{ch_name}'.")
 
 
         ############## Air Scattering ##########

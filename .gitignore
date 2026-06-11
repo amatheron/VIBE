@@ -39,3 +39,11 @@ src/*.egg-info/
 *.out
 *.err
 *.log
+
+# ==========================================
+# Local-only large/binary working files
+# ==========================================
+# Air-scattering Geant4 kernels (large data, generated locally)
+src/vibe/Air_scattering_kernels/
+# Local backup copies of sample images
+src/vibe/OLD_*.png
