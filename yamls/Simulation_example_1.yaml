@@ -57,6 +57,9 @@ IRLaser:                             # Pump beam properties. In this case the pu
 
 
 simulation:                          # General simulation parameters
+  Resolution: 8000                   # Simulation resolution (FIRST parameter). >10 -> N grid cells; <=10 -> um/pixel
+                                     #   (N = propsize/Resolution). A number from the Run_VIBE launch cell
+                                     #   overrides this; if that is None, this yaml value is used.
   save_fig_and_pickle: 1             # 1 : All figures and pickles are saved (can be heavy). 0 : Only the important figures (flow_plot) and a light "summary.npz" are saved.
   save_individual_figures: 1         # 1 : Saving the individual figures in /VIBE/VIBE_outputs/planes (can be a bit heavy if the resolution is high). 0 : not saving individual figures.
   intensity_units: photons           # 'photons' or 'relative'. Unit of the intensity displayed. For 'photons' the code makes sure that "photons_total" photons are at the beam_shaper plane. For 'relative', the first plane intensity maximum will be set to unity.

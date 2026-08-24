@@ -34,6 +34,23 @@ beam_shaper:                         # Beam shaper object : shapes the initial p
   x_offset_um: 0.0                   # [Offset only in the case of an external map] Horizontal offset of the beam center, in [um]
   y_offset_um: 0.0                   # [Offset only in the case of an external map] Vertical offset of the beam center, in [um]
 
+beam_shaper:                         # NEW: external image + wide-Gaussian halo (combined shape).
+  position: -10                      # Plane position [m]
+  type: aperture
+  shape: external_map+halo           # 'external_map' semantics + a wide Gaussian halo blended around the image.
+                                     #   Final normalised intensity :  T = (T_img/peak(T_img) + ratio * halo) / (1 + ratio)
+                                     #   'halo' is a (super-)Gaussian centred on the beam centre.
+  path: "/home/yu79deg/VIBE/src/vibe/Xray_profile_r511_shot_70.png"
+  center: "barycenter"               # same options as 'external_map'
+  calibration: 0                     # 0 -> rescale the image so that its native FWHM matches 'size'; >0 → µm/px
+  size: 9.0e-05                      # target central-peak FWHM [m] (rescaling target when calibration=0)
+  size2: 5.0e-03                     # halo FWHM diameter [m]  (wide Gaussian around the image)
+  ratio: 1.5e-04                     # peak ratio  halo/peak(image)   (same semantics as `doublegaussian`)
+  power2: 1                          # halo super-Gaussian order (1 = pure Gaussian; higher = flatter top)
+  invert: 0
+  x_offset_um: 0.0
+  y_offset_um: 0.0
+
 reg1:                                # Regularisation object : regularises the propagation of the beam.
   in: 0                              # If = 1 the object is applied. If = 0 it is bypassed
   position: 2.0                      # Plane position [m]  
@@ -187,8 +204,39 @@ TCC:                                 # Interaction plane between pump and probe.
 Det:                                 # Detector plane where the total number of photons in a given detector area are indicated
   position: 4.0                      # Plane position [m]
   type: imager                       # Type of plane (imager = does nothing but output a diag at this plane)
-  roi: 13                            # Region of Interest : square area in [um] corresponding to the detector pixel size. The integrated signal will be calculated for this area.
-  roi2: 75                           # Possibility to define a second area size to compare with the first one.
+  # ---------- ROI options ----------
+  # Two integration boxes (roi, roi2) are evaluated at the detector. How their
+  # size is chosen is set by `roi_mode`; `roi`/`roi2` are then interpreted
+  # accordingly:
+  #
+  #   roi_mode: fixed        → roi / roi2 are SIZES IN MICROMETRES. Each defines
+  #                            a square box of that many µm per side.
+  #                            e.g. roi: 75, roi2: 13 → 75×75 µm and 13×13 µm.
+  #
+  #   roi_mode: containment  → roi / roi2 are FRACTIONS in (0, 1]. For each box
+  #                            the code finds the smallest CENTRED window (per
+  #                            axis) that encloses that fraction of the VB_perp
+  #                            signal integral at the detector.
+  #                            e.g. roi: 0.5 (50 %), roi2: 0.9 (90 %).
+  #
+  #   roi_mode: fwhm         → roi / roi2 are MULTIPLIERS of the VB_perp signal
+  #                            FWHM. The box sides equal (roi × FWHM_x,
+  #                            roi × FWHM_y).
+  #                            e.g. roi: 0.99, roi2: 0.5.
+  #
+  #   (roi_mode omitted)     → legacy 'auto': roi > 1 behaves like 'fixed' (µm);
+  #                            0 < roi ≤ 1 behaves like 'fwhm'. Keeps old yamls
+  #                            (roi: 13 / roi2: 75, or roi: 0.999 / roi2: 0.5)
+  #                            working unchanged.
+  #
+  # All integrated quantities (VB_perp, VB_parr, BG, SNR, SF) are reported for
+  # each ROI, and the actual rectangle sizes are printed in the log, drawn on
+  # the Det panel, shown in the flow_plot table (column headers), and stored
+  # in the summary .npz meta as `roi_box_m`, `roi2_box_m`, `roi_label`,
+  # `roi2_label`. The label carries the mode tag (e.g. "62.5×18.5 µm (cont50)").
+  roi_mode: containment              # fixed | containment | fwhm  (omit → auto)
+  roi: 0.5                           # containment: 50 % of the VB_perp signal
+  roi2: 0.9                          # containment: 90 % of the VB_perp signal
   AirScat: 1                         # Air scattering simulation : simulates a given Air thickness just before the detector. This option requires to be coupled to a GEANT4 basis simulation. Some examples can be provided upon request. 
   compute_transmission: 1            # Compute the transmission of the probe through air.
   use_symmetric_kernel: True         # Performs a azimuthal symmetry around the propagation axis to generate a smoother air convolution map.
@@ -217,6 +265,35 @@ IRLaser:                             # Pump beam properties. In this case the pu
   - "/home/yu79deg/VIBE/src/vibe/IR_focus.png"       # Path of the external IR focus image
   - 0                                # Calibration in μm/pixel of the external image. If equal to = 0, the code will match the FWHM of external map laser to be equal to IR_FWHM_gaussian.
 
+IRLaser:                             # Pump beam properties — external IR-focus image with EXPLICIT µm/pixel calibration.
+                                     # Use this mode when the physical pixel size of the recorded IR focus image is known
+                                     # (e.g. from the imaging optics calibration). VIBE uses that pixel size directly,
+                                     # so the effective IR spot size is whatever the raw image encodes — IR_FWHM_gaussian
+                                     # is *ignored* in this mode.
+  phi_VB_deg: 45                     # Polarisation angle between the pump and the probe beam
+  IR_Energy_J: 4.8                   # Total energy of the pulse, at TCC, in [J]
+  IR_FWHM_duration: 30e-15           # Pump FWHM duration [s], (assuming a Gaussian pulsed beam).
+  IR_wavelength: 800e-9              # Pump central wavelength [m]
+  IR_FWHM_gaussian: 1.3e-6           # Placeholder — not used when calibration > 0 in the IR_2Dmap block below.
+  IR_x_offset_m: 0                   # Pump offset in horizontal direction at the focus, in [m]
+  IR_y_offset_m: 0                   # Pump offset in vertical direction at the focus, in [m]
+  Timing_jitter: 0.0                 # Timing mismatch at focus between the pump and the probe, in [s].
+  IR_center_peak: 0                  # 0 → keep the image geometrical centre as the beam centre (recommended for
+                                     #     scans of IR_x_offset_m / IR_y_offset_m on coarse grids).
+                                     # 1 → re-shift the resampled image so its argmax pixel sits at (x_off, y_off).
+                                     #     This snaps the peak to the nearest simulation pixel, which can create
+                                     #     grid-quantised shifts when the pixel size is not ≪ IR FWHM.
+  IR_2Dmap:                          # Options for the external-image pump-focus map with explicit calibration.
+  - "external"                       # Use an externally measured 2D image as the pump focus.
+  - "match_integral"                 # "match_integral" or "match_peak". "match_integral" enforces ∫I dA = P_peak
+                                     # (spatial density × peak power). Recommended when the image itself already
+                                     # carries the correct spot size — it avoids any peak-rescaling step.
+  - "/home/yu79deg/VIBE/src/vibe/Relax_focus_for_VIBE/r401_sh61_focus.png"   # Path of the external IR focus image.
+  - 0.0312                           # Calibration in μm/pixel of the external image. When > 0, VIBE uses this value
+                                     # as the physical pixel size of the source image and *ignores* IR_FWHM_gaussian.
+                                     # The effective IR spot FWHM is then whatever the image itself encodes
+                                     # (image_pixel_FWHM × calibration). See build_ir_focus_map() in VIBE.py.
+
 IRLaser:                             # Pump beam properties. In this case the pump beam is an IR laser.
   phi_VB_deg: 45                     # Polarisation angle between the pump and the probe beam
   IR_Energy_J: 4.8                   # Total energy of the pulse, at TCC, in [J]
@@ -235,8 +312,40 @@ IRLaser:                             # Pump beam properties. In this case the pu
 
 
 simulation:                          # General simulation parameters
-  save_pickle: 1                     # Pickle is saved. It contains all the informations (parameters and diags) of the simulation. [Can be very heavy].
-  save_figures: [individual, flowplot, overlay, mosaic, transmission, lens, vb]       # Name of the figures being saved.
+  Resolution: 8000                   # Simulation resolution (FIRST parameter of the block).
+                                     #   value > 10 -> N, the number of grid cells (e.g. 8000).
+                                     #   value <= 10 -> um/pixel; N is derived as propsize/Resolution so the
+                                     #                  pixel size is fixed regardless of propsize.
+                                     # A number passed from the Run_VIBE launch cell overrides this; if that
+                                     # is None, this yaml value is used. The chosen resolution and its source
+                                     # are printed in a banner at the start of the log.
+  save_pickle: 1                     # Controls the *_figs.pickle file (raw plane images):
+                                     #   0 → do NOT keep the figs pickle. It is briefly written during
+                                     #       the run (needed by flow_plot), then deleted by cleanup.
+                                     #   1 → keep the FULL figs pickle (all element planes + every flow
+                                     #       slice). Heavy: often tens of GB per sim.
+                                     #   2 → keep a PLANES-ONLY figs pickle (all element planes, but the
+                                     #       flow_XXX_* entries are dropped before writing). Typically a
+                                     #       few MB. Lets you reload individual planes later via
+                                     #       mu.loadPickle(...), without the giant flow arrays.
+                                     # In every case the small *_res.pickle (yaml cfg + params +
+                                     # intensities dict) and the per-channel *_summary.npz files are
+                                     # kept — those already contain BG/VB/SNR scalars and the ±500 µm
+                                     # Det_main crop, so most downstream analysis works with save_pickle=2.
+  save_figures: [individual, flowplot, overlay, mosaic, transmission, lens, vb]
+                                     # Which figure categories survive the cleanup. Case-insensitive tokens:
+                                     #   individual     → per-plane images in planes/<sim>/
+                                     #   flowplot       → flows/<sim>_flowplot_main.jpg   (main channel waterfall)
+                                     #                    Auto-keeps 'overlay' whenever it is present, because
+                                     #                    both figures come from the same flow slices.
+                                     #   overlay        → flows/<sim>_overlay.jpg  (main + VB_perp overlay)
+                                     #   vb_flowplots   → flows/<sim>_flowplot_VB_parr.jpg
+                                     #                    flows/<sim>_flowplot_VB_perp.jpg
+                                     #                    (opt-in; usually redundant with 'overlay')
+                                     #   mosaic         → figures/<sim>_main.jpg (+ _VB_parr / _VB_perp)
+                                     #   transmission   → figures/<sim>_summary.jpg
+                                     #   lens           → Lens_diags/<sim>_*        (CRL defect diagnostics)
+                                     #   vb             → VB_figures/<sim>_*        (VB debug crops @TCC)
   individual_fig_log: 0              # If the individual figures (of the planes defined in the yaml file, except the flow planes) must be saved on linear [0] or log scale [1].
   intensity_units: photons           # 'photons' or 'relative'. Unit of the intensity displayed. For 'photons' the code makes sure that "photons_total" photons are at the beam_shaper plane. For 'relative', the first plane intensity maximum will be set to unity.
   beamdiv: 0.0001                    # Initial beam divergence in [rad]
@@ -251,13 +360,22 @@ simulation:                          # General simulation parameters
   profiles_xlim:                     # Intensity xlim for "/figures/...summary"
   - 0
   - 200
-  figs_to_save:                      # List of the Planes to save. The name should match the plane name. If including "flow" the simulation will save a lot of plane to create the "flow_plot".
+  figs_to_save:                      # List of the Planes to STORE inside the figs pickle (before cleanup).
+                                     # The names should match the yaml element blocks (case-sensitive prefix
+                                     # match on el_name.startswith(...)). Include "flow" to keep the
+                                     # automatic flow slices — without it, flow_plot() will find no flow
+                                     # data (metrics + summary npz are still written thanks to the empty-
+                                     # ffigs guard, but the waterfall plots will be skipped).
   - beam_shaper
   - TCC
   - Det
   - flow
   figs_log: 1                        # Log scale for most of the figures
-  edge_damping:                      # Boundary condition : to avoid artefacts, the field is damped at the edge with a sinus function. Edge damping sets the relative size of damping compared to simulation box. 0.25 corresponds to a damping from +-propsize to +-propsize/2.
+  edge_damping:                      # Boundary condition : to avoid artefacts, the field is damped at the edge with a sinus function.
+                                     # Damping is applied radially between r=(0.5 − edge_damping)·propsize
+                                     # and r=0.5·propsize (= box edge). Keep the beam edge well inside
+                                     # r=(0.5 − edge_damping)·propsize to avoid affecting the physics.
+                                     # (yaml_cooker.ipynb sizes propsize automatically so this is honored.)
   - 0.25
   edge_damping_shape: circular       # Shape of the edge damping. "circular" uses a sinus function for damping.
   flow:                              # Parameters of the flow plots saved. Flow planes are saved in this example from -4.2 meter, to +4.2 meter, every 0.01 meter.
@@ -272,3 +390,44 @@ simulation:                          # General simulation parameters
   flow_plot_clim:                   # flow_plot colorbar limits. Defined in relative intensity.
   - 1e-11
   - 50
+
+# ============================================================
+#  Notes about the *_res.pickle contents (auto-populated)
+# ------------------------------------------------------------
+# After each run, _res.pickle stores (elements_dict, params). The
+# `params['intensities']` dict is now enriched with per-channel ROI
+# integrals + SNR at the detector, so downstream analysis notebooks
+# don't need to reload the huge _figs.pickle to get the standard
+# metrics. Values are in *relative intensity × m²*; multiply by
+# `params['scale_phot']` to convert to photons.
+#
+# The `roi` and `roi2` boxes are the ones defined in the Det yaml block
+# (see the Det: section above). They can be either fixed µm squares
+# (value > 1) or adaptive rectangles hugging the VB_perp FWHM
+# (0 < value ≤ 1). The actual box dimensions are stored alongside the
+# values via `roi_box_m` / `roi2_box_m` (a (rect_x_m, rect_y_m) tuple)
+# and `roi_label` / `roi2_label` (human-readable strings such as
+# "13.0×13.0 µm" or "5.7×3.8 µm (frac)").
+#
+#   intensities['roi']                       ← alias: main-channel integral in the roi  box
+#   intensities['roi2']                      ← alias: main-channel integral in the roi2 box
+#   intensities['roi_Det_{ch}']              ← per-channel roi  integral at Det (ch = main | VB_parr | VB_perp)
+#   intensities['roi2_Det_{ch}']             ← per-channel roi2 integral at Det
+#   intensities['{el_name}_{ch_name}']       ← total integrated intensity (whole map, all planes)
+#   intensities['roi_box_m']                 ← (rect_x_m, rect_y_m) actual roi  box dimensions
+#   intensities['roi2_box_m']                ← (rect_x_m, rect_y_m) actual roi2 box dimensions
+#   intensities['roi_mode']  / ['roi2_mode'] ← 'um' | 'contNN' | 'fwhm×V'
+#   intensities['roi_label'] / ['roi2_label']← 'A×B µm' or 'A×B µm (<mode>)'
+#   intensities['BG_roi'],  intensities['BG_roi2']       ← main channel  @ Det (aliases)
+#   intensities['VB_parr_roi'],  intensities['VB_parr_roi2']
+#   intensities['VB_perp_roi'],  intensities['VB_perp_roi2']
+#   intensities['SNR_VB_parr_roi'],  intensities['SNR_VB_parr_roi2']
+#   intensities['SNR_VB_perp_roi'],  intensities['SNR_VB_perp_roi2']
+#
+# The summary .npz meta mirrors the same info under
+#   meta['VB_photons'][pol]['roi'|'roi2']    ← ROI integrals (string keys)
+#   meta['BG_photons']['roi'|'roi2']         ← BG integrals
+#   meta['SNR'][(pol, 'roi'|'roi2')]         ← SNR values
+#   meta['roi_box_m'], meta['roi2_box_m']    ← actual box dimensions
+#   meta['roi_label'], meta['roi2_label']    ← human-readable labels
+# ============================================================

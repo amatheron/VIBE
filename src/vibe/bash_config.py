@@ -31,7 +31,23 @@ source ~/.bashrc
 eval "$(micromamba shell hook --shell=bash)"
 micromamba activate {env_name}
 
-python {script_path} {script_kwargs}
+# --- Debug/diagnostic env for tracking down native (C-level) crashes ---
+#   PYTHONFAULTHANDLER=1  -> dump a Python + C stack trace on SIGSEGV / SIGABRT
+#   PYTHONUNBUFFERED=1    -> never lose the last print before a crash
+#   MALLOC_CHECK_=3       -> glibc heap checker: SIGABRT with location on double
+#                            free / heap corruption (rather than a silent segfault)
+#   HDF5_USE_FILE_LOCKING=FALSE -> prevents h5py from stalling / crashing on shared
+#                                   filesystems (BeeGFS/Lustre) when the DABAM .h5
+#                                   files are opened concurrently.
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export MALLOC_CHECK_=3
+export HDF5_USE_FILE_LOCKING=FALSE
+
+# `-X faulthandler` and `-X dev` complement the env-var above (extra dev-mode
+# warnings + guaranteed faulthandler regardless of env stripping); `-u` is
+# unbuffered stdout (redundant with PYTHONUNBUFFERED but harmless).
+python -X faulthandler -X dev -u {script_path} {script_kwargs}
 '''
 
 
@@ -48,7 +64,7 @@ DEFAULT_SBATCH_PARAMS = {
 
 
 
-def write_bash(path, N, upd_params={}, bash_name=None):
+def write_bash(path, resolution, upd_params={}, bash_name=None):
 
     bash_params = DEFAULT_SBATCH_PARAMS.copy()
     if upd_params:
@@ -61,7 +77,10 @@ def write_bash(path, N, upd_params={}, bash_name=None):
     if not yaml_arg.is_absolute():
         yaml_arg = YAML_DIR / yaml_arg
 
-    bash_params['script_kwargs'] = f'-N {N} --yaml {yaml_arg}'
+    # resolution: None -> use the Resolution written in the YAML; a number overrides it
+    # (>10 = N grid cells, <=10 = um/pixel).
+    res_arg = "" if resolution is None else f"--resolution {resolution}"
+    bash_params['script_kwargs'] = f'--yaml {yaml_arg} {res_arg}'.strip()
     bash_params['jobname'] = yaml_arg.stem
 
     bash_params['log_out'] = str(LOG_DIR / f"{bash_params['jobname']}.log")

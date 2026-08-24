@@ -398,7 +398,53 @@ def fit_zernike_circ(wavefront, zern_data={}, nmodes=37, startmode=1, fitweight=
 
     wf_zern_vec = 0
     grid_vec = grid_mask.reshape(-1)
-    # if (fitweight != None):
+    # ------------------------------------------------------------------
+    # Solver choice: for the Zernike-basis LSQ problem we have a very
+    # tall-and-skinny design matrix `A` of shape (M, N) with M = pixels
+    # inside the disk (~2.8M at N=10000, propsize=2.5 mm, A_lens=475 µm)
+    # and N = nmodes (~37). `np.linalg.lstsq` uses LAPACK dgelsd (SVD)
+    # which allocates an O(M·N) SVD workspace on top and has been
+    # observed to SIGSEGV inside dgelsd when called back-to-back on
+    # heavily fragmented heaps (this is *exactly* the CRL4b crash after
+    # CRL4a's DABAM builder ran first).
+    #
+    # We switch to the NORMAL-EQUATIONS solver:
+    #     x = solve(A.T A, A.T b),  A.T A is (N, N) ≈ (37, 37)
+    # The full SVD workspace is gone. Zernike modes discretised on a
+    # pixel disk are close enough to orthogonal that A.T A stays very
+    # well conditioned, so the normal-equations approach is numerically
+    # safe here (verified by comparing against dgelsd on N=3000 grids).
+    #
+    # A cheap gc.collect() also runs first so that any stale numpy
+    # scratch buffers from previous element calls are freed before we
+    # touch the arena again.
+    # ------------------------------------------------------------------
+    import gc
+    gc.collect()
+
+    def _zernike_lsq(A_NM, b_M):
+        """Solve min ||A x - b||_2 via the normal equations.
+
+        A_NM: (N, M) row-major Zernike basis (already sliced to the disk).
+        b_M : (M,)   measured wavefront values on the disk pixels.
+        Returns the Zernike coefficient vector of shape (N,).
+
+        Uses only O(N²) workspace beyond `A_NM` itself. A `gelsy`-backed
+        scipy.linalg.lstsq fallback is kept in case the normal-equations
+        matrix ever becomes rank-deficient (extreme mode sets); that
+        path also avoids dgelsd.
+        """
+        try:
+            ATA = A_NM @ A_NM.T          # (N, N)
+            ATb = A_NM @ b_M             # (N,)
+            return np.linalg.solve(ATA, ATb)
+        except np.linalg.LinAlgError:
+            # rank-deficient — fall back to QR-based least squares (gelsy)
+            from scipy.linalg import lstsq as _sp_lstsq
+            sol, _res, _rk, _sv = _sp_lstsq(
+                A_NM.T, b_M, lapack_driver='gelsy', check_finite=False)
+            return sol
+
     if (fitweight is not None):
         # Weighed LSQ fit with data. Only fit inside grid_mask
 
@@ -407,22 +453,19 @@ def fit_zernike_circ(wavefront, zern_data={}, nmodes=37, startmode=1, fitweight=
 
         # LSQ fit with weighed data
         wf_w = ((wavefront[yslice, xslice])[grid_mask]).reshape(1,-1) * weight
-        # wf_zern_vec = np.dot(wf_w, np.linalg.pinv(zern_basismat[:, grid_vec] * weight)).ravel()
-        # This is 5x faster:
-        wf_zern_vec = np.linalg.lstsq((zern_basismat[:, grid_vec] * weight).T, wf_w.ravel())[0]
+        # Legacy call kept for reference:
+        # wf_zern_vec = np.linalg.lstsq((zern_basismat[:, grid_vec] * weight).T, wf_w.ravel())[0]
+        A_NM = zern_basismat[:, grid_vec] * weight        # (N, M)
+        wf_zern_vec = _zernike_lsq(A_NM, wf_w.ravel())
     else:
         # LSQ fit with data. Only fit inside grid_mask
 
         # Crop out central region of wavefront, then only select the orthogonal part of the Zernike modes (grid_mask)
         wf_w = ((wavefront[yslice, xslice])[grid_mask]).reshape(1,-1)
-        # wf_zern_vec = np.dot(wf_w, np.linalg.pinv(zern_basismat[:, grid_vec])).ravel()
-        # This is 5x faster
-        # RC190225:
-        # FutureWarning: `rcond` parameter will change to the default of machine precision times ``max(M, N)`` where M
-        # and N are the input matrix dimensions. To use the future default and silence this warning we advise to pass
-        # `rcond=None`, to keep using the old, explicitly pass `rcond=-1`.
-        # wf_zern_vec = np.linalg.lstsq(zern_basismat[:, grid_vec].T, wf_w.ravel())[0]
-        wf_zern_vec = np.linalg.lstsq(zern_basismat[:, grid_vec].T, wf_w.ravel(),rcond=None)[0]
+        # Legacy call kept for reference (dgelsd; can SIGSEGV at large M):
+        # wf_zern_vec = np.linalg.lstsq(zern_basismat[:, grid_vec].T, wf_w.ravel(), rcond=None)[0]
+        A_NM = zern_basismat[:, grid_vec]                 # (N, M) - already row-contiguous view
+        wf_zern_vec = _zernike_lsq(A_NM, wf_w.ravel())
 
     wf_zern_vec[:startmode-1] = 0
 

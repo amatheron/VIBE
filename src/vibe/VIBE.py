@@ -120,7 +120,67 @@ def yamlval(key,ip,default=0):
 
 
 
-def run_from_yaml(yaml_path: str, N: int):
+# ----------------------------------------------------------------------------
+# Output location
+# ----------------------------------------------------------------------------
+# Simulation outputs must NOT be written next to the source code on the (small,
+# backed-up) home filesystem. They go to the cluster "work" filesystem instead.
+# Override with the VIBE_OUTPUT_DIR environment variable if needed.
+DEFAULT_OUTPUT_ROOT = "/work/yu79deg/VIBE_outputs"
+
+
+def get_output_root() -> Path:
+    """Root directory for all VIBE simulation outputs.
+
+    Defaults to ``/work/yu79deg/VIBE_outputs`` (cluster work filesystem).
+    Set the environment variable ``VIBE_OUTPUT_DIR`` to override.
+    """
+    return Path(os.environ.get("VIBE_OUTPUT_DIR", DEFAULT_OUTPUT_ROOT))
+
+
+def resolve_resolution(cfg, resolution_cli=None, N_legacy=None):
+    """
+    Resolve the transverse grid size N from a 'Resolution' value.
+
+    Resolution semantics:
+      * value  > 10  -> N, the number of grid cells (used directly)
+      * value <= 10  -> um/pixel; N = propsize / value so the pixel size matches
+    Priority: launch-cell --resolution  >  YAML simulation.Resolution  >  legacy -N  >  1000.
+    A banner is printed stating the value used and where it came from.
+    """
+    S = cfg.get("simulation", {})
+    propsize = float(yamlval("propsize", S, 0.0))
+    res_yaml = yamlval("Resolution", S, None)
+
+    if resolution_cli is not None:
+        res_value, source = float(resolution_cli), "launch cell (--resolution)"
+    elif res_yaml is not None:
+        res_value, source = float(res_yaml), "YAML (simulation.Resolution)"
+    elif N_legacy is not None:
+        res_value, source = float(N_legacy), "legacy -N argument"
+    else:
+        res_value, source = 1000.0, "default (1000)"
+
+    if res_value > 10:
+        N = int(round(res_value))
+        desc = (f"N = {N} grid cells  (pixel size {propsize / max(N, 1) * 1e6:.4f} um/px)"
+                if propsize > 0 else f"N = {N} grid cells")
+    else:
+        if propsize <= 0:
+            raise ValueError("Resolution given as um/pixel but simulation.propsize is missing/zero in the YAML.")
+        N = int(round(propsize * 1e6 / res_value))
+        desc = f"{res_value:g} um/pixel  ->  N = {N} grid cells  (propsize {propsize * 1e3:.4f} mm)"
+
+    bar = "=" * 74
+    print("\n" + bar)
+    print("  VIBE SIMULATION RESOLUTION")
+    print(f"    {desc}")
+    print(f"    source: {source}")
+    print(bar + "\n")
+    return N
+
+
+def run_from_yaml(yaml_path: str, resolution_cli=None, N: int = None):
     """
     Run a complete VIBE simulation from a YAML configuration file.
 
@@ -129,7 +189,8 @@ def run_from_yaml(yaml_path: str, N: int):
     - builds the ordered list of optical elements,
     - initializes global simulation parameters,
     - runs the main VIBE engine,
-    - stores result pickles and figures in ``VIBE_outputs``.
+    - stores result pickles and figures under ``get_output_root()``
+      (default ``/work/yu79deg/VIBE_outputs``).
 
     It is the main entry point when launching VIBE from the command line
     or from batch jobs.
@@ -140,12 +201,15 @@ def run_from_yaml(yaml_path: str, N: int):
 
     basepath = Path(__file__).resolve().parents[2]
 
-    projectdir = basepath / "VIBE_outputs"
+    projectdir = get_output_root()
     projectdir.mkdir(parents=True, exist_ok=True)
     projectdir = str(projectdir)
 
     print(basepath)
     print(projectdir)
+
+    # ---- resolve the simulation Resolution -> grid size N (prints a banner) ----
+    N = resolve_resolution(cfg, resolution_cli=resolution_cli, N_legacy=N)
 
     input_params = build_input_params(cfg, N=N, projectdir=projectdir, filename=yamlname)
 
@@ -394,49 +458,6 @@ def sort_elements(elements, debug=0):
     return elements_sorted
 
 
-"""
-def cleanup_heavy_outputs(projectdir: Path, filename: str):
-
-    import glob, os
-
-    # Directories
-    figs_dir     = Path(projectdir) / "figures"
-    flow_dir     = Path(projectdir) / "flows"
-    lens_dir     = Path(projectdir) / "Lens_diags"
-    vb_dir       = Path(projectdir) / "VB_figures"
-    pickles_dir  = Path(projectdir) / "pickles"
-
-    # Patterns to remove
-    patterns = [
-        f"{figs_dir}/{filename}_main.jpg",
-        f"{figs_dir}/{filename}_summary.jpg",
-        f"{figs_dir}/{filename}_VB_parr.jpg",
-        f"{figs_dir}/{filename}_VB_perp.jpg",
-        f"{flow_dir}/{filename}_flowplot_VB_parr.jpg",
-        f"{flow_dir}/{filename}_flowplot_VB_perp.jpg",
-        f"{lens_dir}/{filename}*",       # remove all lens diagnostics with this stem
-        f"{vb_dir}/{filename}*",         # remove all VB diagnostics with this stem
-        f"{pickles_dir}/{filename}_figs.pickle",
-        f"{pickles_dir}/{filename}_res.pickle",
-    ]
-
-    removed = []
-    for pat in patterns:
-        for file in glob.glob(pat):
-            try:
-                os.remove(file)
-                removed.append(file)
-            except Exception:
-                pass
-
-    if removed:
-        print(f"[CLEANUP] Removed {len(removed)} heavy files for {filename}:")
-        for r in removed:
-            print("   -", r)
-    else:
-        print(f"[CLEANUP] No files found to remove for {filename}.")
-
-"""
 
 def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int = 1, save_figures=None):
     """
@@ -449,13 +470,19 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
     filename : str
         YAML stem used as output filename
     save_pickle : int
-        1 -> keep pickles, 0 -> remove pickles
+        0 -> remove _figs.pickle and _res.pickle
+        1 -> keep the FULL pickle (all planes + flow slices, heavy)
+        2 -> keep the pickle (should already be planes-only if main_VIBE
+             saved it with save_pickle=2 — this branch just protects the
+             file from being deleted)
     save_figures : list[str] | None
         List of figure categories to keep.
         Supported tokens (case-insensitive):
             - individual
-            - flowplot
-            - overlay
+            - flowplot        (main waterfall  — auto-keeps 'overlay' too)
+            - vb_flowplots    (VB_parr / VB_perp waterfalls; off by default because
+                               the overlay already contains the same information)
+            - overlay         (main + VB overlay waterfall)
             - mosaic
             - transmission
             - lens
@@ -468,14 +495,22 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
     if save_figures:
         keep = {str(x).strip().lower() for x in save_figures if str(x).strip()}
 
+    # ── auto-link: overlay is always kept together with the main flowplot,
+    # because both live in flows/ and are derived from the same flow slices.
+    # This makes 'flowplot' in the yaml enough to preserve the overlay
+    # (previously users had to remember to list both).
+    if "flowplot" in keep:
+        keep.add("overlay")
+
     keep_individual    = ("individual" in keep)
     keep_flowplot      = ("flowplot" in keep)
+    keep_vb_flowplots  = ("vb_flowplots" in keep)   # NEW: VB channel waterfalls
     keep_overlay       = ("overlay" in keep)
     keep_mosaic        = ("mosaic" in keep)
     keep_transmission  = ("transmission" in keep)
     keep_lens          = ("lens" in keep)
     keep_vb            = ("vb" in keep)
-    keep_pickle        = (int(save_pickle) == 1)
+    keep_pickle        = (int(save_pickle) in (1, 2))
 
     # Directories
     figs_dir     = Path(projectdir) / "figures"
@@ -504,16 +539,22 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
     # -----------------------------
     # FLOWS (flows/ directory)
     # -----------------------------
-    # flowplot bucket: *_flowplot_VB_* plus *_flowplot_main*
+    # 'flowplot' bucket: main waterfall only
     if not keep_flowplot:
         patterns += [
-            str(flow_dir / f"{filename}_flowplot_VB_parr.jpg"),
-            str(flow_dir / f"{filename}_flowplot_VB_perp.jpg"),
             str(flow_dir / f"{filename}_flowplot_main*"),
         ]
 
+    # 'vb_flowplots' bucket: the VB_parr / VB_perp waterfalls (opt-in;
+    # the overlay already merges main+VB, so these are usually redundant)
+    if not keep_vb_flowplots:
+        patterns += [
+            str(flow_dir / f"{filename}_flowplot_VB_parr.jpg"),
+            str(flow_dir / f"{filename}_flowplot_VB_perp.jpg"),
+        ]
+
     # overlay bucket: anything like <filename>_*overlay*
-    # (your example: LP_965_overlay)
+    # (auto-kept whenever 'flowplot' is kept — see set-population above)
     if not keep_overlay:
         patterns += [
             str(flow_dir / f"{filename}*overlay*"),
@@ -672,21 +713,15 @@ _index_cache = {}     # Index module cache, to be defined before the function ge
 
 def get_index(elem, E, table_dir=None):
     """
-    Return delta and beta by interpolating the Henke data for given element and energy.
-    If table_dir is not specified, it is assumed to be next to VIBE.py
+    Return (beta, delta) by interpolating the Henke data for the given
+    element and energy.
+
+    Files under ``optical_constants/{elem}.txt`` are the raw Henke output
+    (https://henke.lbl.gov/optical_constants/getdb2.html), which have two
+    header lines followed by ``Energy(eV), Delta, Beta`` columns.
     """
     global _index_cache
 
-    # Special case for Hafnium
-    if elem == 'Hf':
-        return 3.2887e-6 , 1.988e-5
-    
-    if elem=='W':  
-        return 2.85704482E-06 , 3.86332977E-05
-    
-    if elem=='Au':   #Gold (79)
-        return 3.55916109E-06 , 3.95017742E-05
-    
     # Locate optical_constants folder relative to the file location of VIBE.py
     if table_dir is None:
         table_dir = Path(__file__).parent / "optical_constants"
@@ -699,8 +734,10 @@ def get_index(elem, E, table_dir=None):
         )
 
     if elem not in _index_cache:
-        data = np.genfromtxt(filepath, comments='#', skip_header=1)
-        if data.shape[1] < 3:
+        # skip_header=2 → drops the two Henke header lines
+        # (" <elem> Density=...", " Energy(eV), Delta, Beta")
+        data = np.genfromtxt(filepath, comments='#', skip_header=2)
+        if data.ndim != 2 or data.shape[1] < 3:
             raise ValueError(f"Expected ≥3 columns (E, delta, beta) in {filepath}")
         energies = data[:, 0]
         delta = data[:, 1]
@@ -708,6 +745,11 @@ def get_index(elem, E, table_dir=None):
         _index_cache[elem] = (energies, delta, beta)
 
     energies, delta_vals, beta_vals = _index_cache[elem]
+    if E < energies.min() or E > energies.max():
+        print(f"[get_index] WARNING: E={E:.1f} eV is outside the Henke table "
+              f"range [{energies.min():.0f}, {energies.max():.0f}] eV for "
+              f"element '{elem}' — values will be extrapolated by np.interp "
+              f"(clamped to nearest edge).")
     delta = np.interp(E, energies, delta_vals)
     beta  = np.interp(E, energies, beta_vals)
     return beta, delta
@@ -2532,7 +2574,192 @@ def _sanitize_intensity_map(img: np.ndarray) -> np.ndarray:
     return arr
 
 
+# =====================================================================
+# ROI helpers (fixed-size µm OR fraction of the VB_perp signal FWHM)
+# =====================================================================
+def _fwhm_1d_index(profile):
+    """Return the FWHM of a 1D profile in *sample* units (pixels)."""
+    y = np.asarray(profile, dtype=np.float64)
+    if y.size < 3 or y.max() <= 0 or not np.any(np.isfinite(y)):
+        return float("nan")
+    y = y - float(np.nanmin(y))
+    i0 = int(np.nanargmax(y))
+    if y[i0] <= 0:
+        return float("nan")
+    half = 0.5 * y[i0]
+    # left crossing
+    left  = np.where(y[:i0] < half)[0]
+    right = np.where(y[i0:] < half)[0]
+    if left.size == 0 or right.size == 0:
+        return float("nan")
+    kL = left[-1]
+    kR = i0 + right[0]
+    # linear interpolation of the crossing positions
+    xL = kL + (half - y[kL])   / (y[kL+1] - y[kL] + 1e-300)
+    xR = kR - 1 + (half - y[kR-1]) / (y[kR]   - y[kR-1] + 1e-300)
+    return float(xR - xL)
 
+
+def fwhm_xy_of_image(image, dx_m):
+    """
+    Return (fwhm_x_m, fwhm_y_m) of the peak of `image`, measured as horizontal
+    (x) and vertical (y) lineouts through the max pixel.  `dx_m` is the pixel
+    size in metres (square pixels assumed).
+
+    Used by the Det `roi_mode: fwhm` (and legacy `auto`) box sizing.
+    """
+    img = np.asarray(image, dtype=np.float64)
+    if img.size == 0 or not np.isfinite(img).any() or img.max() <= 0:
+        return float("nan"), float("nan")
+    iy, ix = np.unravel_index(np.nanargmax(img), img.shape)
+    fx_px  = _fwhm_1d_index(img[iy, :])
+    fy_px  = _fwhm_1d_index(img[:, ix])
+    fx_m   = fx_px * dx_m if np.isfinite(fx_px) else float("nan")
+    fy_m   = fy_px * dx_m if np.isfinite(fy_px) else float("nan")
+    return fx_m, fy_m
+
+
+# =====================================================================
+# Containment-size helper (used by Det.roi_mode: containment)
+# ---------------------------------------------------------------------
+# Supports the `Det.roi_mode` yaml key. See `Simulation_definitions.yaml`
+# for the documentation of the available modes.
+# =====================================================================
+def _centred_containment_size_1d(prof, dx_m, frac=0.90):
+    """Smallest CENTRED half-window that encloses `frac` of `prof`'s integral.
+
+    Returns the full window width in metres. The window is centred on the
+    peak of `prof` (so the metric tracks the signal, not the grid centre).
+    Robust to multi-lobe / interference structures.
+    """
+    y = np.asarray(prof, dtype=np.float64)
+    if y.size == 0:
+        return float("nan")
+    y = np.where(np.isfinite(y), y, 0.0)
+    y = np.clip(y - y.min(), 0.0, None)                    # remove floor
+    tot = y.sum()
+    if tot <= 0:
+        return float("nan")
+    i_peak = int(np.argmax(y))
+    N      = y.size
+    # cumulative sum around the peak (expand symmetrically in half-integer
+    # steps so we grow the window one pixel at a time on each side)
+    left, right = i_peak, i_peak
+    acc = y[i_peak]
+    target = float(frac) * tot
+    while acc < target and (left > 0 or right < N - 1):
+        # choose the side that would ADD the most mass next
+        cand_l = y[left - 1]  if left  > 0        else -1.0
+        cand_r = y[right + 1] if right < N - 1    else -1.0
+        if cand_r >= cand_l and right < N - 1:
+            right += 1; acc += y[right]
+        elif left > 0:
+            left  -= 1; acc += y[left]
+        else:
+            right += 1; acc += y[right]
+    return float(right - left + 1) * float(dx_m)
+
+
+def resolve_roi_box(roi_val, roi_mode, image=None, dx_m=None,
+                    fwhm_x_m=None, fwhm_y_m=None):
+    """
+    Resolve ONE Det ROI rectangle from a yaml `roi`/`roi2` value and the Det
+    `roi_mode`. Returns (rect_x_m, rect_y_m, label_tag) or None on bad input.
+
+    roi_mode
+    --------
+    'fixed'        `roi_val` is a size in micrometres. Square box
+                   `roi_val` µm × `roi_val` µm.               label_tag = 'um'
+    'containment'  `roi_val` is a fraction in (0, 1]. The box is the smallest
+                   CENTRED window (per axis) enclosing that fraction of
+                   `image`'s integral.                        label_tag = 'contNN'
+    'fwhm'         `roi_val` is a multiplier. The box is
+                   (roi_val × FWHM_x, roi_val × FWHM_y) of `image`.
+                                                              label_tag = 'fwhm×V'
+    'auto'         Backward-compatible default for yamls written before the
+                   `roi_mode` key existed: roi_val > 1 → 'fixed' (µm);
+                   0 < roi_val ≤ 1 → 'fwhm' fraction.
+
+    For 'fwhm'/'auto' you may pass precomputed fwhm_x_m / fwhm_y_m so the FWHM
+    isn't recomputed for every roi; otherwise they are derived from `image`.
+    The 'containment'/'fwhm' modes use the VB_perp Det image (with the main
+    Det image as a fallback) provided by the caller via `image`.
+    """
+    if roi_val is None:
+        return None
+    try:
+        v = float(roi_val)
+    except Exception:
+        return None
+    if v <= 0:
+        return None
+
+    mode = str(roi_mode or "auto").lower()
+
+    # 'auto' (legacy, no roi_mode key): pick the concrete mode from the value.
+    if mode == "auto":
+        mode = "fixed" if v > 1.0 else "fwhm"
+
+    # ---- fixed square box in micrometres --------------------------------
+    if mode == "fixed":
+        return v * 1e-6, v * 1e-6, "um"
+
+    # ---- fraction × FWHM of the reference image -------------------------
+    if mode == "fwhm":
+        fx, fy = fwhm_x_m, fwhm_y_m
+        if fx is None or fy is None:
+            if image is None or dx_m is None:
+                return None
+            fx, fy = fwhm_xy_of_image(image, dx_m)
+        if not (np.isfinite(fx) and np.isfinite(fy) and fx > 0 and fy > 0):
+            return None
+        return v * float(fx), v * float(fy), f"fwhm×{v:g}"
+
+    # ---- smallest centred window enclosing fraction `v` of the signal ---
+    if mode == "containment":
+        if image is None or dx_m is None:
+            return None
+        f = min(max(v, 0.01), 0.9999)
+        img = np.asarray(image, dtype=np.float64)
+        sx = _centred_containment_size_1d(img.sum(axis=0), dx_m, frac=f)   # collapse Y → x
+        sy = _centred_containment_size_1d(img.sum(axis=1), dx_m, frac=f)   # collapse X → y
+        if not (np.isfinite(sx) and np.isfinite(sy) and sx > 0 and sy > 0):
+            return None
+        return float(sx), float(sy), f"cont{int(round(100*f))}"
+
+    # unknown mode
+    return None
+
+
+def integrate_rect(image, dx_m, rect_x_m, rect_y_m):
+    """
+    Integrate an intensity image over a centred rectangle of size
+    rect_x_m × rect_y_m. Returns the integral in [image units × m²].
+    """
+    if image is None or image.size == 0:
+        return float("nan")
+    Ny, Nx = image.shape
+    hx = max(int(round((rect_x_m / dx_m) / 2)), 1)
+    hy = max(int(round((rect_y_m / dx_m) / 2)), 1)
+    cx = Nx // 2
+    cy = Ny // 2
+    x0, x1 = max(0, cx - hx), min(Nx, cx + hx)
+    y0, y1 = max(0, cy - hy), min(Ny, cy + hy)
+    return float(np.nansum(image[y0:y1, x0:x1]) * (dx_m ** 2))
+
+
+def roi_label(rect_x_m, rect_y_m, mode):
+    """Compact label 'A×B µm' (fixed) or 'A×B µm (<mode>)' (adaptive).
+
+    `mode` is the tag returned by `resolve_roi_box`: the literal 'um' for the
+    fixed-µm branch, or e.g. 'cont90' / 'fwhm×0.5' for the adaptive branches.
+    Legacy pickles/npz stored 'frac'; it still renders sensibly here.
+    """
+    x_um = rect_x_m * 1e6
+    y_um = rect_y_m * 1e6
+    if mode == "um":
+        return f"{x_um:.1f}×{y_um:.1f} µm"
+    return f"{x_um:.1f}×{y_um:.1f} µm ({mode})"
 
 
 def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertical_type='center', log=1, xl=None, flow_figs=0, flow_plot_crange=1e-5, channel="main", include_flow=True, unit=None):
@@ -2627,6 +2854,16 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         ffigs = ffigs_filtered
 
     print(f"[DEBUG] ffigs for channel '{channel}': {len(ffigs)} found")
+
+    # ── Guard: no flow slices → skip waterfall, but STILL compute
+    # VB/BG/SNR from Det_* planes and write the summary npz.  This lets
+    # sims whose yaml does not save flow slices (or where flow was
+    # skipped for size reasons) still produce a usable _main_summary.npz.
+    has_flow = len(ffigs) > 0
+    if not has_flow:
+        print(f"[flow_plot] No flow slices for channel '{channel}' "
+              f"— skipping waterfall plot. Metrics + summary npz will "
+              f"still be written from Det_* planes.")
 
     # ─── Intensity unit handling ─────────────────────────────────────
     unit_sel = unit or params.get('intensity_units', 'relative')
@@ -2771,83 +3008,112 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
 
 
-    fig, ax = plt.subplots(figsize=(14, 8))
+    fig, ax = (plt.subplots(figsize=(14, 8)) if has_flow else (None, None))
 
-    mu.pcolor(
-        xc=zax,
-        yc=gyax,
-        data=fixedfall,
-        log=log,
-        ticks=None,
-        cl=cl,
-        colorbar=False
-    )
+    if has_flow:
+        # ─── Auto-clamp colour limits to the actual waterfall data range ───
+        # The default `cl` is [1e-11, 50] (relative units) × scale.  For sims
+        # where the reference-plane integrand is small (e.g. narrow-image
+        # beam_shapers in the 5000-series, ∑I ~ 1e-8 → scale_phot ~ 1e32),
+        # `cl` ends up bracketed 10^21 … 10^34 photons/m², orders of magnitude
+        # above every actual pixel — so the whole waterfall renders black.
+        # Detect that and rescale to ~11 decades below the observed peak so
+        # the plot always shows structure regardless of scale_phot.
+        _data_pos = fixedfall[np.isfinite(fixedfall) & (fixedfall > 0)]
+        if _data_pos.size:
+            _dmax  = float(np.nanmax(_data_pos))
+            _drange = 1e11        # ~11 decades of dynamic range
+            _needs_rescale = (cl[0] > _dmax) or (cl[1] < _dmax / _drange) or (cl[1] > _dmax * 1e4)
+            if _needs_rescale:
+                cl_new = [_dmax / _drange, _dmax]
+                print(f"[FLOW] Auto-clamping colour range to data: "
+                      f"[{cl[0]:.2e}, {cl[1]:.2e}] → [{cl_new[0]:.2e}, {cl_new[1]:.2e}]  "
+                      f"(peak = {_dmax:.2e})")
+                cl = cl_new
 
-    # Add colorbar with label
-    cb = plt.colorbar()
-    if vertical_type in ("average_horiz", "center"):
-        cb_label = {
-            "photons": "photons / m²",
-            "Wcm2": "W / m²",
-            "relative": "relative units"
-        }.get(unit_sel, "relative units")
-    else:
-        cb_label = y_label
-    cb.set_label(cb_label)
+        mu.pcolor(
+            xc=zax,
+            yc=gyax,
+            data=fixedfall,
+            log=log,
+            ticks=None,
+            cl=cl,
+            colorbar=False
+        )
 
-    # Overlay propagation box profile (normalized to gyax)
-    profile = mu.normalize(propsizes) * np.max(gyax)
-    plt.plot(zax, profile, 'r-')
+        # Add colorbar with label
+        cb = plt.colorbar()
+        if vertical_type in ("average_horiz", "center"):
+            cb_label = {
+                "photons": "photons / m²",
+                "Wcm2": "W / m²",
+                "relative": "relative units"
+            }.get(unit_sel, "relative units")
+        else:
+            cb_label = y_label
+        cb.set_label(cb_label)
 
-    # Draw optical element markers (only within visible z-range)
-    if not partial:
-        maxy = np.min(gyax)
-        row = 0
-        zmin_vis = np.nanmin(zax)
-        zmax_vis = np.nanmax(zax)
+        # Overlay propagation box profile (normalized to gyax)
+        profile = mu.normalize(propsizes) * np.max(gyax)
+        plt.plot(zax, profile, 'r-')
 
-        for el_name, el in res[0].items():
-            if (
-                'position' not in el or
-                not mu.yamlval('in', el, 1) or
-                el_name.startswith("flow_")
-            ):
-                continue
+        # Draw optical element markers (only within visible z-range)
+        if not partial:
+            maxy = np.min(gyax)
+            row = 0
+            zmin_vis = np.nanmin(zax)
+            zmax_vis = np.nanmax(zax)
 
-            pos = el['position']
-            # --- skip annotations outside visible region ---
-            if pos < zmin_vis or pos > zmax_vis:
-                continue
+            for el_name, el in res[0].items():
+                if (
+                    'position' not in el or
+                    not mu.yamlval('in', el, 1) or
+                    el_name.startswith("flow_")
+                ):
+                    continue
 
-            if len(el_name) == 2:  # short names like L1, L2
-                yline = maxy * (0.8 if 'L' in el_name else 0.72)
-                col = [1, 0.5, 0.9] if 'L' in el_name else [1, 0.9, 0.7]
-            else:
-                yline = maxy * (0.95 - row * 0.05)
-                col = 'w'
-                row = (row + 1) % 4
+                pos = el['position']
+                # --- skip annotations outside visible region ---
+                if pos < zmin_vis or pos > zmax_vis:
+                    continue
 
-            plt.plot([pos, pos], [maxy, yline], color=col)
-            mu.text(pos + 0.05, yline, el_name, color=col, fs=16, zorder=50, background=None)
+                if len(el_name) == 2:  # short names like L1, L2
+                    yline = maxy * (0.8 if 'L' in el_name else 0.72)
+                    col = [1, 0.5, 0.9] if 'L' in el_name else [1, 0.9, 0.7]
+                else:
+                    yline = maxy * (0.95 - row * 0.05)
+                    col = 'w'
+                    row = (row + 1) % 4
+
+                plt.plot([pos, pos], [maxy, yline], color=col)
+                mu.text(pos + 0.05, yline, el_name, color=col, fs=16, zorder=50, background=None)
 
 
-    # Detector marker (white vertical line)
-    elements_dict = res[0] if isinstance(res, (list, tuple)) and len(res) > 0 else {}
-    det_dict = elements_dict.get("Det", {})
-    det_pos = det_dict.get("position", None)
-    roi_um  = det_dict.get("roi", 13)  # microns, consistent with gyax units
+        # Detector marker (white vertical line) — length = roi box vertical size
+        elements_dict = res[0] if isinstance(res, (list, tuple)) and len(res) > 0 else {}
+        det_dict = elements_dict.get("Det", {})
+        det_pos = det_dict.get("position", None)
+        # Prefer the actual resolved box height from intensities (adaptive-aware);
+        # fall back to interpreting det_dict['roi'] as µm.
+        _intens_here = params.get("intensities", {}) if isinstance(params, dict) else {}
+        _box_r = _intens_here.get("roi_box_m") if isinstance(_intens_here, dict) else None
+        if isinstance(_box_r, (list, tuple)) and len(_box_r) == 2:
+            roi_um = float(_box_r[1]) * 1e6           # vertical size in µm
+        else:
+            _rv = float(det_dict.get("roi", 13))
+            roi_um = _rv if _rv > 1.0 else 13.0       # fallback 13 µm if fraction w/o info
 
-    if det_pos is not None:
-        plt.plot([det_pos, det_pos], [-roi_um/2, roi_um/2], 'w-', lw=5)
+        if det_pos is not None:
+            plt.plot([det_pos, det_pos], [-roi_um/2, roi_um/2], 'w-', lw=5)
 
-    # Axes labels and limits
-    plt.xlabel('Position [m]')
-    plt.ylabel('Horizontal position [μm]')
-    plt.xlim(xl if xl else [np.min(zax), np.max(zax)])
-    plt.ylim(np.min(gyax), np.max(gyax))  # ← enforce correct y-range
-    plt.title(f"{file} cut: {vertical_type}")
+        # Axes labels and limits
+        plt.xlabel('Position [m]')
+        plt.ylabel('Horizontal position [μm]')
+        plt.xlim(xl if xl else [np.min(zax), np.max(zax)])
+        plt.ylim(np.min(gyax), np.max(gyax))  # ← enforce correct y-range
+        plt.title(f"{file} cut: {vertical_type}")
 
-    plt.tight_layout()
+        plt.tight_layout()
 
     # ─── Total photon count at beam shaper plane ───
     elements_dict = res[0]
@@ -2896,24 +3162,57 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     key_central = f"{centralelement}_{channel}"
 
     intens = params.get("intensities", {})
+    # Shadow factors. Initialised to NaN so the flow-plot table never crashes
+    # with an UnboundLocalError when a Det ROI integral is missing (e.g. no
+    # roi/roi2 key, or an unresolved adaptive box).
+    t13 = float("nan")
+    t75 = float("nan")
     if key_central in intens:
         t1 = intens[key_central] / intens.get("start", 1.0)
         tr_scat = yamlval("transmission_of_scatterer_L2", params, 1)
+        _cen = intens[key_central]
 
-        if "roi" in intens and "roi2" in intens:
-            t13 = intens["roi"] / intens[key_central] / tr_scat
-            t75 = intens["roi2"] / intens[key_central] / tr_scat
+        if _cen and "roi" in intens:
+            t13 = intens["roi"] / _cen / tr_scat
+        if _cen and "roi2" in intens:
+            t75 = intens["roi2"] / _cen / tr_scat
+        if np.isfinite(t13) and np.isfinite(t75) and t13 != 0:
             print(f"SFA13 = {t13:.1e}, SFA75 = {t75:.1e}, Ratio = {t75/t13:.2f}")
 
-            ax = plt.gca()
+            # (dead assignment removed; TABLE OF RESULTS block calls plt.gca()
+            #  again when it actually needs to draw text.)
+
+    # ─── Resolve the two Det ROI boxes (roi, roi2) --------------------------
+    # Priority:
+    #   1. If _res.pickle already carries `roi_box_m` / `roi2_box_m` in
+    #      intensities (populated by main_VIBE), use those (adaptive or fixed).
+    #   2. Otherwise, fall back to the legacy fixed 13 µm / 75 µm boxes.
+    _det_yaml_dict = res[0].get("Det", {}) if isinstance(res, (list, tuple)) and len(res) > 0 else {}
+    intens_all     = params.get("intensities", {}) if isinstance(params, dict) else {}
+
+    def _get_box(tag):
+        """Return (rect_x_m, rect_y_m, label)."""
+        box = intens_all.get(f"{tag}_box_m")
+        lbl = intens_all.get(f"{tag}_label")
+        if box is not None and isinstance(box, (list, tuple)) and len(box) == 2:
+            return float(box[0]), float(box[1]), (lbl or roi_label(box[0], box[1], intens_all.get(f"{tag}_mode", "um")))
+        # legacy fallback (13/75 µm squares)
+        legacy = {"roi": 13e-6, "roi2": 75e-6}[tag]
+        return legacy, legacy, f"{legacy*1e6:.0f}×{legacy*1e6:.0f} µm"
+
+    box_roi_x , box_roi_y , label_roi  = _get_box("roi")
+    box_roi2_x, box_roi2_y, label_roi2 = _get_box("roi2")
+    roi_specs  = (("roi",  box_roi_x,  box_roi_y,  label_roi),
+                  ("roi2", box_roi2_x, box_roi2_y, label_roi2))
 
     # ─── VB SIGNAL (Detector photon count) ───────────────────────────
-    VB_photons = {}  # will store nested dicts like {'VB_parr': {13e-6: val, 75e-6: val}}
+    VB_photons = {}   # {'VB_parr': {'roi': v, 'roi2': v}, ...}   (string keys)
 
     try:
         tcc_dict = res[0].get("TCC", {})
         if int(tcc_dict.get("VB_signal", 0)) == 1:
             print("\n[VB SIGNAL] Computing VB_perp and VB_parr photon counts at detector...")
+            print(f"[VB SIGNAL] roi  box = {label_roi}   roi2 box = {label_roi2}")
 
             for pol in ["VB_parr", "VB_perp"]:
                 key = f"Det_{pol}"
@@ -2933,20 +3232,11 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                 else:
                     img_scaled = img
 
-                VB_photons[pol] = {}  # initialize sub-dict for this polarization
-
-                # Compute for two ROI sizes
-                for roi_um in [13e-6, 75e-6]:
-                    roi_half_px = int((roi_um / dx_m) / 2)
-                    center_px = N // 2
-                    x0, x1 = center_px - roi_half_px, center_px + roi_half_px
-                    y0, y1 = center_px - roi_half_px, center_px + roi_half_px
-
-                    sub_img = img_scaled[y0:y1, x0:x1]
-                    photons_total = np.nansum(sub_img) * (dx_m ** 2)
-                    VB_photons[pol][roi_um] = photons_total
-
-                    print(f"→ {pol}: {photons_total:.3e} photons in {roi_um*1e6:.0f} µm × {roi_um*1e6:.0f} µm ROI")
+                VB_photons[pol] = {}
+                for tag, rx, ry, lbl in roi_specs:
+                    photons_total = integrate_rect(img_scaled, dx_m, rx, ry)
+                    VB_photons[pol][tag] = photons_total
+                    print(f"→ {pol}: {photons_total:.3e} in {lbl}")
 
     except Exception as e:
         import traceback
@@ -2964,24 +3254,17 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             N_main = img_main.shape[0]
             dx_m_main = propsize_main / N_main
 
-            # Compute for two ROI sizes: 13 µm and 75 µm
-            for roi_um in [13e-6, 75e-6]:
-                roi_half_px = int((roi_um / dx_m_main) / 2)
-                center_px = N_main // 2
-                x0, x1 = center_px - roi_half_px, center_px + roi_half_px
-                y0, y1 = center_px - roi_half_px, center_px + roi_half_px
+            if unit_sel == "photons":
+                img_scaled_main = img_main * scale_ph
+            elif unit_sel == "Wcm2":
+                img_scaled_main = img_main * scale_Wcm
+            else:
+                img_scaled_main = img_main
 
-                sub_img = img_main[y0:y1, x0:x1]
-                if unit_sel == "photons":
-                    img_scaled_main = img_main * scale_ph
-                elif unit_sel == "Wcm2":
-                    img_scaled_main = img_main * scale_Wcm
-                else:
-                    img_scaled_main = img_main
-
-                photons_total = np.nansum(img_scaled_main[y0:y1, x0:x1]) * (dx_m_main ** 2)
-                BG_photons[roi_um] = photons_total
-                print(f"→ BG photons ({roi_um*1e6:.0f} µm box): {photons_total:.3e}")
+            for tag, rx, ry, lbl in roi_specs:
+                photons_total = integrate_rect(img_scaled_main, dx_m_main, rx, ry)
+                BG_photons[tag] = photons_total
+                print(f"→ BG photons in {lbl}: {photons_total:.3e}")
         else:
             print("[BG PHOTONS] No Det_main found in pickle.")
     except Exception as e:
@@ -2992,63 +3275,65 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     SNR = {}
     if VB_photons and BG_photons:
         for pol in ["VB_parr", "VB_perp"]:
-            for roi_um in [13e-6, 75e-6]:
-                vb_val = VB_photons.get(pol, {}).get(roi_um, np.nan)
-                bg_val = BG_photons.get(roi_um, np.nan)
+            for tag in ("roi", "roi2"):
+                vb_val = VB_photons.get(pol, {}).get(tag, np.nan)
+                bg_val = BG_photons.get(tag, np.nan)
                 if np.isfinite(vb_val) and np.isfinite(bg_val) and bg_val != 0:
-                    SNR[(pol, roi_um)] = vb_val / bg_val
+                    SNR[(pol, tag)] = vb_val / bg_val
 
 
 
     # ─── TABLE OF RESULTS ON THE PLOT ───────────────────────────────────
-    if True:  # always draw if we have at least SF or VB or BG
+    if has_flow:  # only draw the table when a flow plot exists
         ax = plt.gca()
         text_lines = []
 
-        # headers
-        text_lines.append(f"{'Quantity':<10} | {'13µm':>10} | {'75µm':>10}")
-        text_lines.append("-" * 35)
+        # ---- column headers use the actual box dimensions --------------
+        col_r  = label_roi
+        col_r2 = label_roi2
+        text_lines.append(f"{'Quantity':<10} | {col_r:>18} | {col_r2:>18}")
+        text_lines.append("-" * (10 + 3 + 18 + 3 + 18))
 
         # Shadow factors (always available)
-        text_lines.append(f"{'SF':<10} | {t13:>10.2e} | {t75:>10.2e}")
+        text_lines.append(f"{'SF':<10} | {t13:>18.2e} | {t75:>18.2e}")
 
         # --- VB photon counts (if available) ---
         if 'VB_parr' in VB_photons or 'VB_perp' in VB_photons:
-            VB_parr_13 = VB_photons.get('VB_parr', {}).get(13e-6, np.nan)
-            VB_parr_75 = VB_photons.get('VB_parr', {}).get(75e-6, np.nan)
-            VB_perp_13 = VB_photons.get('VB_perp', {}).get(13e-6, np.nan)
-            VB_perp_75 = VB_photons.get('VB_perp', {}).get(75e-6, np.nan)
+            VB_parr_r  = VB_photons.get('VB_parr', {}).get('roi',  np.nan)
+            VB_parr_r2 = VB_photons.get('VB_parr', {}).get('roi2', np.nan)
+            VB_perp_r  = VB_photons.get('VB_perp', {}).get('roi',  np.nan)
+            VB_perp_r2 = VB_photons.get('VB_perp', {}).get('roi2', np.nan)
 
-            text_lines.append(f"{'VB||':<10} | {VB_parr_13:>10.2e} | {VB_parr_75:>10.2e}")
-            text_lines.append(f"{'VB⊥':<10} | {VB_perp_13:>10.2e} | {VB_perp_75:>10.2e}")
+            text_lines.append(f"{'VB||':<10} | {VB_parr_r:>18.2e} | {VB_parr_r2:>18.2e}")
+            text_lines.append(f"{'VB⊥':<10} | {VB_perp_r:>18.2e} | {VB_perp_r2:>18.2e}")
         else:
-            text_lines.append(f"{'VB||':<10} | {'n/a':>10} | {'n/a':>10}")
-            text_lines.append(f"{'VB⊥':<10} | {'n/a':>10} | {'n/a':>10}")
+            text_lines.append(f"{'VB||':<10} | {'n/a':>18} | {'n/a':>18}")
+            text_lines.append(f"{'VB⊥':<10} | {'n/a':>18} | {'n/a':>18}")
 
         # --- Background photons (always computed) ---
-        BG_13 = BG_photons.get(13e-6, np.nan)
-        BG_75 = BG_photons.get(75e-6, np.nan)
-        text_lines.append(f"{'BG':<10} | {BG_13:>10.2e} | {BG_75:>10.2e}")
+        BG_r  = BG_photons.get('roi',  np.nan)
+        BG_r2 = BG_photons.get('roi2', np.nan)
+        text_lines.append(f"{'BG':<10} | {BG_r:>18.2e} | {BG_r2:>18.2e}")
 
         # --- SNR (only if VB present) ---
         if SNR:
-            SNR_parr_13 = SNR.get(('VB_parr', 13e-6), np.nan)
-            SNR_parr_75 = SNR.get(('VB_parr', 75e-6), np.nan)
-            SNR_perp_13 = SNR.get(('VB_perp', 13e-6), np.nan)
-            SNR_perp_75 = SNR.get(('VB_perp', 75e-6), np.nan)
+            SNR_parr_r  = SNR.get(('VB_parr', 'roi'),  np.nan)
+            SNR_parr_r2 = SNR.get(('VB_parr', 'roi2'), np.nan)
+            SNR_perp_r  = SNR.get(('VB_perp', 'roi'),  np.nan)
+            SNR_perp_r2 = SNR.get(('VB_perp', 'roi2'), np.nan)
 
-            text_lines.append(f"{'SNR||':<10} | {SNR_parr_13:>10.2e} | {SNR_parr_75:>10.2e}")
-            text_lines.append(f"{'SNR⊥':<10} | {SNR_perp_13:>10.2e} | {SNR_perp_75:>10.2e}")
+            text_lines.append(f"{'SNR||':<10} | {SNR_parr_r:>18.2e} | {SNR_parr_r2:>18.2e}")
+            text_lines.append(f"{'SNR⊥':<10} | {SNR_perp_r:>18.2e} | {SNR_perp_r2:>18.2e}")
         else:
-            text_lines.append(f"{'SNR||':<10} | {'n/a':>10} | {'n/a':>10}")
-            text_lines.append(f"{'SNR⊥':<10} | {'n/a':>10} | {'n/a':>10}")
+            text_lines.append(f"{'SNR||':<10} | {'n/a':>18} | {'n/a':>18}")
+            text_lines.append(f"{'SNR⊥':<10} | {'n/a':>18} | {'n/a':>18}")
 
         # Draw the text box
         table_text = "\n".join(text_lines)
         ax.text(
             0.98, 0.95, table_text,
             transform=ax.transAxes,
-            fontsize=10,
+            fontsize=9,
             family="monospace",
             va="top", ha="right",
             bbox=dict(facecolor="white", edgecolor="none", alpha=0.7)
@@ -3057,11 +3342,14 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
 
     # ─── Save main flow plot ───
-    outdir = Path(project_dir) / "flows"
-    outdir.mkdir(parents=True, exist_ok=True)
-    outfile = outdir / f"{file}_flowplot_{channel}.jpg"
-    plt.savefig(outfile)
-    print(f"[FLOW] Saved main flow plot to {outfile}")
+    if has_flow:
+        outdir = Path(project_dir) / "flows"
+        outdir.mkdir(parents=True, exist_ok=True)
+        outfile = outdir / f"{file}_flowplot_{channel}.jpg"
+        plt.savefig(outfile)
+        print(f"[FLOW] Saved main flow plot to {outfile}")
+    else:
+        print(f"[FLOW] Skipped saving flow plot (no flow slices for channel '{channel}').")
 
 
     # ─── Save lightweight summary (.npz) ───────────────────────────────
@@ -3083,6 +3371,39 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     else:
         fixedfall_save = fixedfall.copy()
 
+    # --- always-on cropped detector plane (only for the main channel) -----
+    # We store a ±500 µm square crop of the main detector image in 'relative'
+    # units so downstream analysis (e.g. A1-scan notebooks) can recover the
+    # detector plane even when save_pickle == 0 (full figs pickle deleted).
+    # Convert to photons/m² with: img * meta['scale_ph']  (then × dx_m² for
+    # photons per pixel).
+    det_main_img       = None
+    det_main_dx_m      = None
+    det_main_extent_m  = None
+    if channel == "main" and isinstance(pic, dict) and "Det_main" in pic:
+        try:
+            d_img, _, d_propsize_m, _ = pic["Det_main"]
+            d_img    = np.asarray(d_img, dtype=np.float32)
+            N_det    = d_img.shape[0]
+            dx_det_m = float(d_propsize_m) / N_det
+            crop_half_m  = 500e-6
+            crop_half_px = int(round(crop_half_m / dx_det_m))
+            c  = N_det // 2
+            i0 = max(0, c - crop_half_px)
+            i1 = min(N_det, c + crop_half_px)
+            det_main_img      = d_img[i0:i1, i0:i1]
+            det_main_dx_m     = dx_det_m
+            det_main_extent_m = np.array([-(c - i0) * dx_det_m,
+                                           (i1 - c) * dx_det_m,
+                                          -(c - i0) * dx_det_m,
+                                           (i1 - c) * dx_det_m],
+                                         dtype=np.float64)
+            print(f"[FLOW] Cropped Det_main saved: shape={det_main_img.shape}, "
+                  f"dx={dx_det_m*1e6:.2f} µm, extent=±"
+                  f"{(c - i0) * dx_det_m * 1e6:.0f} µm (relative units).")
+        except Exception as _e:
+            print(f"[FLOW] WARN: failed to crop Det_main for summary npz: {_e}")
+
     # --- metadata contains scaling factors for later use ---
     meta = {
         "file": file,
@@ -3097,15 +3418,26 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         "VB_photons": VB_photons,
         "BG_photons": BG_photons,
         "SNR": SNR,
+        # ---- adaptive-ROI info ---------------------------------------
+        # box dimensions in metres (rect_x, rect_y). String keys "roi"/"roi2".
+        "roi_box_m":  (box_roi_x,  box_roi_y),
+        "roi2_box_m": (box_roi2_x, box_roi2_y),
+        "roi_label":  label_roi,
+        "roi2_label": label_roi2,
     }
 
-    np.savez_compressed(
-        summary_path,
+    save_kwargs = dict(
         zax=zax,
         gyax=gyax,
         fixedfall=fixedfall_save,
-        meta=np.array(meta, dtype=object)
+        meta=np.array(meta, dtype=object),
     )
+    if det_main_img is not None:
+        save_kwargs["det_main_img"]      = det_main_img       # 2D, relative units
+        save_kwargs["det_main_dx_m"]     = np.float64(det_main_dx_m)
+        save_kwargs["det_main_extent_m"] = det_main_extent_m  # (xmin,xmax,ymin,ymax) [m]
+
+    np.savez_compressed(summary_path, **save_kwargs)
     print(f"[FLOW] Saved lightweight summary → {summary_path} (stored in relative units)")
 
 
@@ -3240,6 +3572,10 @@ def overlay_flowplots(
             "VB_photons": meta.get("VB_photons", {}),
             "BG_photons": meta.get("BG_photons", {}),
             "SNR": meta.get("SNR", {}),
+            "roi_label":  meta.get("roi_label"),
+            "roi2_label": meta.get("roi2_label"),
+            "roi_box_m":  meta.get("roi_box_m"),
+            "roi2_box_m": meta.get("roi2_box_m"),
         }
 
     # --- Interpolate on shared z grid ---
@@ -3300,38 +3636,59 @@ def overlay_flowplots(
     VB_meta   = summaries.get("main", {}).get("VB_photons", {})
     BG_meta   = summaries.get("main", {}).get("BG_photons", {})
     SNR_meta  = summaries.get("main", {}).get("SNR", {})
+    # ROI labels come from the summary meta (populated by flow_plot)
+    _summary_main_meta = summaries.get("main", {})
+    _lbl_r  = _summary_main_meta.get("roi_label",  "13×13 µm")
+    _lbl_r2 = _summary_main_meta.get("roi2_label", "75×75 µm")
+
+    # helper: read {new-style 'roi'|'roi2' string key, or legacy 13e-6/75e-6 float}
+    def _pick(d, str_key, legacy_um):
+        if d is None:
+            return np.nan
+        if str_key in d:
+            return d[str_key]
+        return d.get(legacy_um, np.nan)
 
     if any([meta_main, VB_meta, BG_meta, SNR_meta]):
         text_lines = [
-            f"{'Quantity':<10} | {'13 µm':>10} | {'75 µm':>10}",
-            "-" * 35,
+            f"{'Quantity':<10} | {_lbl_r:>16} | {_lbl_r2:>16}",
+            "-" * (10 + 3 + 16 + 3 + 16),
         ]
         t13, t75 = meta_main.get("SFA13", np.nan), meta_main.get("SFA75", np.nan)
-        text_lines.append(f"{'SF':<10} | {t13:>10.2e} | {t75:>10.2e}")
+        text_lines.append(f"{'SF':<10} | {t13:>16.2e} | {t75:>16.2e}")
 
-        vb_parr_13 = VB_meta.get("VB_parr", {}).get(13e-6, np.nan)
-        vb_parr_75 = VB_meta.get("VB_parr", {}).get(75e-6, np.nan)
-        vb_perp_13 = VB_meta.get("VB_perp", {}).get(13e-6, np.nan)
-        vb_perp_75 = VB_meta.get("VB_perp", {}).get(75e-6, np.nan)
+        vb_parr_r  = _pick(VB_meta.get("VB_parr", {}), "roi",  13e-6)
+        vb_parr_r2 = _pick(VB_meta.get("VB_parr", {}), "roi2", 75e-6)
+        vb_perp_r  = _pick(VB_meta.get("VB_perp", {}), "roi",  13e-6)
+        vb_perp_r2 = _pick(VB_meta.get("VB_perp", {}), "roi2", 75e-6)
         text_lines += [
-            f"{'VB||':<10} | {vb_parr_13:>10.2e} | {vb_parr_75:>10.2e}",
-            f"{'VB⊥':<10} | {vb_perp_13:>10.2e} | {vb_perp_75:>10.2e}",
+            f"{'VB||':<10} | {vb_parr_r:>16.2e} | {vb_parr_r2:>16.2e}",
+            f"{'VB⊥':<10} | {vb_perp_r:>16.2e} | {vb_perp_r2:>16.2e}",
         ]
-        bg_13, bg_75 = BG_meta.get(13e-6, np.nan), BG_meta.get(75e-6, np.nan)
-        text_lines.append(f"{'BG':<10} | {bg_13:>10.2e} | {bg_75:>10.2e}")
-        snr_parr_13 = SNR_meta.get(("VB_parr", 13e-6), np.nan)
-        snr_parr_75 = SNR_meta.get(("VB_parr", 75e-6), np.nan)
-        snr_perp_13 = SNR_meta.get(("VB_perp", 13e-6), np.nan)
-        snr_perp_75 = SNR_meta.get(("VB_perp", 75e-6), np.nan)
+        bg_r  = _pick(BG_meta, "roi",  13e-6)
+        bg_r2 = _pick(BG_meta, "roi2", 75e-6)
+        text_lines.append(f"{'BG':<10} | {bg_r:>16.2e} | {bg_r2:>16.2e}")
+
+        def _pick_snr(pol, tag, legacy_um):
+            if SNR_meta is None:
+                return np.nan
+            if (pol, tag) in SNR_meta:
+                return SNR_meta[(pol, tag)]
+            return SNR_meta.get((pol, legacy_um), np.nan)
+
+        snr_parr_r  = _pick_snr("VB_parr", "roi",  13e-6)
+        snr_parr_r2 = _pick_snr("VB_parr", "roi2", 75e-6)
+        snr_perp_r  = _pick_snr("VB_perp", "roi",  13e-6)
+        snr_perp_r2 = _pick_snr("VB_perp", "roi2", 75e-6)
         text_lines += [
-            f"{'SNR||':<10} | {snr_parr_13:>10.2e} | {snr_parr_75:>10.2e}",
-            f"{'SNR⊥':<10} | {snr_perp_13:>10.2e} | {snr_perp_75:>10.2e}",
+            f"{'SNR||':<10} | {snr_parr_r:>16.2e} | {snr_parr_r2:>16.2e}",
+            f"{'SNR⊥':<10} | {snr_perp_r:>16.2e} | {snr_perp_r2:>16.2e}",
         ]
         table_text = "\n".join(text_lines)
         ax.text(
             0.98, 0.95, table_text,
             transform=ax.transAxes,
-            fontsize=10,
+            fontsize=9,
             family="monospace",
             va="top", ha="right",
             bbox=dict(facecolor="white", edgecolor="none", alpha=0.7)
@@ -3789,6 +4146,18 @@ def apply_air_layer(F, el_dict, params, el_name="air_layer"):
     e_keV = data["e"]
 
     E0_keV = float(el_dict.get("beam_energy_keV", 8.8))
+
+    # The air-scattering PSF/transmission use E0_keV, which is FIXED by the
+    # pre-computed Geant4 file (regenerating those is expensive). It is
+    # therefore intentionally *decoupled* from params['photon_energy'] (i.e.
+    # Xbeam.photonenergy). If you change Xbeam.photonenergy but keep the old
+    # Geant4 file, the air scattering will still be evaluated at E0_keV.
+    xbeam_keV = float(params.get('photon_energy', 0.0)) / 1e3
+    if xbeam_keV > 0.0 and abs(xbeam_keV - E0_keV) > 0.1:
+        print(f"[air_layer] NOTE: Xbeam.photonenergy = {xbeam_keV:.3f} keV "
+              f"but air-scattering PSF was generated at E0 = {E0_keV:.3f} keV. "
+              f"The air layer stays at {E0_keV:.3f} keV (Geant4 file locked); "
+              f"regenerate the .npz file if you need a matching energy.")
 
     # number of primary photons
     n_prim = el_dict.get("N_primaries", None)
@@ -4719,7 +5088,7 @@ def build_external_shaper_mask(el_dict: dict, F, params: dict) -> np.ndarray:
     *intensity* after the mask to match the image (up to a global factor).
 
     YAML (under a 'type: aperture' element):
-      shape: external_map
+      shape: external_map            (or 'external_map+halo' for a Gaussian halo)
       path: "/abs/path/to/Xray_initial_beam.png"
       calibration: <μm/px>      # if 0, scale the image to FWHM='size'
       size: <FWHM_diameter_m>   # used only when calibration == 0
@@ -4730,13 +5099,20 @@ def build_external_shaper_mask(el_dict: dict, F, params: dict) -> np.ndarray:
       # or in microns:
       # x_offset_um: 0.0
       # y_offset_um: 0.0
+
+    Optional halo (only for shape == 'external_map+halo'):
+      size2:  <halo FWHM diameter [m]>       # wide Gaussian added around the image
+      ratio:  <halo/peak ratio>              # peak(halo) / peak(image), like doublegaussian
+      power2: <halo super-Gaussian order>    # default 1 (pure Gaussian)
     """
     path = el_dict.get("path", None)
     calib_um_per_px = el_dict.get("calibration", None)
+    shape_typ = str(el_dict.get("shape", "external_map"))
+    with_halo = shape_typ.replace(" ", "").lower() in ("external_map+halo", "external+halo")
     if not path:
-        raise ValueError("beam_shaper.external_map needs a 'path' to an image.")
+        raise ValueError(f"beam_shaper.{shape_typ} needs a 'path' to an image.")
     if calib_um_per_px is None:
-        raise ValueError("beam_shaper.external_map needs 'calibration' (μm/px), or 0 to use 'size' as FWHM.")
+        raise ValueError(f"beam_shaper.{shape_typ} needs 'calibration' (μm/px), or 0 to use 'size' as FWHM.")
 
     # -- load + sanitize (make grayscale, drop NaN/Inf, clamp negatives)
     try:
@@ -4817,24 +5193,67 @@ def build_external_shaper_mask(el_dict: dict, F, params: dict) -> np.ndarray:
     T = interp(np.column_stack([(Yg - dy_center).ravel(), (Xg - dx_center).ravel()])).reshape(F.N, F.N)
     T = np.maximum(T, 0.0)
 
+    # -- optional Gaussian halo (external_map+halo): renormalise both peaks to 1
+    # and combine as (T_norm + ratio*halo) / (1+ratio), exactly like the
+    # `doublegaussian` shape. Halo is centered on the beam centre (x_off_m, y_off_m).
+    if with_halo:
+        halo_fwhm  = float(el_dict.get("size2", 0.0))
+        halo_ratio = float(el_dict.get("ratio", 0.0))
+        halo_power = float(el_dict.get("power2", 1.0))
+        Tmax = float(T.max()) if T.size else 0.0
+        if halo_fwhm > 0 and halo_ratio > 0 and Tmax > 0:
+            T_norm = T / Tmax
+            sigma_halo = halo_fwhm / (2.0 * np.sqrt(2.0) *
+                                      (np.log(2.0)) ** (1.0 / (2.0 * halo_power)))
+            r2 = (Xg - x_off_m)**2 + (Yg - y_off_m)**2
+            halo = np.exp(-((r2 / (2.0 * sigma_halo**2)) ** halo_power))
+            T = (T_norm + halo_ratio * halo) / (1.0 + halo_ratio)
+            print(f"[beam_shaper] external_map+halo: peak_ratio={halo_ratio:.3e}, "
+                  f"halo FWHM={halo_fwhm*1e3:.2f} mm, power={halo_power}")
+    # --------------------------------------------------------------
+
     # -- build intensity transmission so that (M * I_in) ∝ T (shape match)
     I_in = Intensity(0, F)
-    # NOTE: do the division in float64 and explicitly mask cells where I_in==0.
-    # The field is float32 (complex64 backing); a Python-float eps like 1e-300
-    # added to a float32 array underflows to 0 under NumPy >=2 (NEP 50), so the
-    # previous `T / (I_in + eps)` produced 0/0 = NaN in any cell where both T
-    # and I_in are exactly zero (e.g. corners where edge_damping forces the
-    # field to 0 and the source image does not extend). A single NaN cell is
-    # later smeared across the whole grid by Forvard's FFT, turning every
-    # downstream plane into all-NaN. See bug investigation notes.
+    # NOTE: do the division in float64 and explicitly mask cells where I_in is
+    # BELOW a robust support threshold (not just ==0).  The field is float32
+    # (complex64 backing); a Python-float eps like 1e-300 added to a float32
+    # array underflows to 0 under NumPy >=2 (NEP 50), so `T / (I_in + eps)`
+    # produced 0/0 = NaN in any cell where both T and I_in are exactly zero.
+    #
+    # In addition, the OLD `mask = I_in64 > 0` was too permissive: on a large
+    # simulation grid the incoming Gaussian starter beam decays to ≪10⁻¹⁰ of
+    # its peak in the far corners, while the shaper's halo (external_map+halo
+    # `ratio` term) can still be ~10⁻⁴ there.  The ratio T/I_in then explodes
+    # in those far tails, so `mmax = np.nanmax(M0)` was governed by those
+    # outliers → the returned mask was scaled down by many orders of magnitude
+    # → the outgoing beam had ~10⁻(N) times less energy than it should, and
+    # `scale_phot` blew up correspondingly (overflowing float32 downstream).
+    # The effect became worse the LARGER `propsize` was, which is exactly the
+    # LP_5905 (propsize 360 µm) vs LP_5908 (propsize 600 µm) discrepancy.
+    #
+    # We restrict the mask to the "beam support": pixels where I_in is within
+    # 60 dB of its peak.  That covers ~5σ of a Gaussian starter beam — more
+    # than enough — and is completely insensitive to how big the propagation
+    # box is chosen.  Outside the support the mask is 0 (no light there
+    # anyway; the shaper can't create photons where the input beam has none).
     I_in64 = np.asarray(I_in, dtype=np.float64)
     T64    = np.asarray(T,    dtype=np.float64)
-    mask   = I_in64 > 0.0
+    I_peak = float(np.nanmax(I_in64)) if I_in64.size else 0.0
+    if I_peak <= 0 or not np.isfinite(I_peak):
+        return np.zeros_like(I_in)
+    # 60 dB below peak intensity — well above any float underflow but low
+    # enough not to clip the real beam. Fine on Gaussian/super-Gaussian
+    # starters (I_in > 1e-6·peak covers r ≤ ≈5σ).
+    _SUPPORT_THR = 1e-6
+    support = I_in64 > (_SUPPORT_THR * I_peak)
     M0 = np.zeros_like(I_in64)
-    np.divide(T64, I_in64, out=M0, where=mask)
-    mmax = float(np.nanmax(M0)) if M0.size else 0.0
+    np.divide(T64, I_in64, out=M0, where=support)
+    mmax = float(np.nanmax(M0[support])) if support.any() else 0.0
     if not np.isfinite(mmax) or mmax <= 0:
         return np.zeros_like(I_in)
+    _support_frac = float(support.mean())
+    print(f"[beam_shaper] mask support: {_support_frac*100:.1f}% of grid, "
+          f"mmax={mmax:.3e}  (I_in_peak={I_peak:.3e})")
     M = np.clip(M0 / mmax, 0.0, 1.0).astype(I_in.dtype, copy=False)
 
     return M
@@ -4888,7 +5307,10 @@ def handle_custom_CRL(F: Field,
     ROC       = yamlval('ROC',   el_dict, None)                           # Radius of curvature of the parabolic surface          [m]
     L         = yamlval('L',     el_dict, None)                           # Total mechanical lens thickness                       [m]
     A         = yamlval('A',     el_dict, None)                           # Geometric aperture radius                             [m]
-    t_wall    = yamlval('twall', el_dict, None)                           # Minimal lens thickness (apex-to-apex)                 [m]
+    # Apex thickness: yaml key is ``t_wall``; ``twall`` is kept as a legacy
+    # fallback. Reading the wrong key here silently dropped the user value and
+    # forced the 30 µm default branch below — see fix log.
+    t_wall    = yamlval('t_wall', el_dict, yamlval('twall', el_dict, None)) # Minimal lens thickness (apex-to-apex)                 [m]
     nb_lenses = yamlval('nb_lenses',   el_dict, None)                     # Number of lenses in the CRL stack
     focal_lenght_stack = yamlval('focal_lenght_stack',   el_dict, None)   # Focal length of the stack                             [m]
     add_aperture = yamlval('add_aperture',   el_dict, 0)                  # If we want to add a circular aperture around the lens [Boolean]
@@ -4908,13 +5330,16 @@ def handle_custom_CRL(F: Field,
         print(f"[INFO] t_wall not provided → defaulting to 30 µm, recomputed L = {L*1e3:.3f} mm")
 
     elif A is not None and t_wall is not None:
-        # Case 3: both given → verify consistency
+        # Case 3: both given → L is fully determined by the parabola equation.
+        #         Derive it when the yaml omits L; only verify when L was supplied.
         L_expected = t_wall + (A**2) / (4.0 * ROC)
-        if abs(L_expected - L) > 0.05 * L:
+        if L is None:
+            L = L_expected
+        elif abs(L_expected - L) > 0.05 * L:
             print(f"[WARN] Given A={A*1e6:.0f} µm and t_wall={t_wall*1e6:.0f} µm "
                 f"imply L≈{L_expected*1e3:.3f} mm, differs from input L={L*1e3:.3f} mm")
     else:
-        raise ValueError("Custom_CRL: must provide either (A) or (twall), and ROC, L.")
+        raise ValueError("Custom_CRL: must provide either (A) or (t_wall), and ROC, L.")
 
         
     print(f"[CRL parameters] : ROC = {ROC*1e6:.0f} um, L = {L*1e3:.1f} mm, Diameter Aperture A = {A*1e6:.0f} um, Apex thickness t_wall = {t_wall*1e6:.0f} um")
@@ -5347,12 +5772,20 @@ def plot_dabam_stack_diagnostics(projectdir, el_dict, dabam_sets,
     fig.suptitle(f"{sim_name}, {lens_name}, Defects — {summary}", fontsize=13)
 
     # save
+    #
+    # NOTE: `tight_layout()` combined with `savefig(bbox_inches="tight")` is a
+    # well-known matplotlib hazard -- both trigger layout resolution and, with
+    # certain axis/colorbar configurations, can enter a non-terminating draw
+    # loop (observed with LP_2400: a 5-lens CRL4b stack froze here for hours
+    # while LP_2233 with the same code went through fine, cf. GH #9218). We
+    # drop `tight_layout()` (bbox_inches="tight" already handles the trim) and
+    # add flush=True prints so any future hang can be pinpointed.
     try:
-        plt.tight_layout()
         Path(save_dir, "Lens_diags").mkdir(parents=True, exist_ok=True)
         out = Path(save_dir, "Lens_diags", f"{filename_stem}_defects_stack.png")
-        plt.savefig(out, dpi=220, bbox_inches="tight")
-        print(f"[PLOT] Saved defects stack → {out}")
+        print(f"[PLOT] savefig(dabam stack) → {out}", flush=True)
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"[PLOT] Saved defects stack → {out}", flush=True)
     finally:
         plt.close(fig)
 
@@ -5714,59 +6147,54 @@ def apply_element(bundle: FieldBundle,
     propsize   = params['propsize']                # current physical window
     wavelength = params['wavelength']
 
+    # Capture the regularisation state ONCE, before the per-channel loop, so every
+    # channel makes the same reg/dereg decision and the shared reg_prop_dict is
+    # updated idempotently (not mangled channel-by-channel).
+    _reg_was  = reg_prop_dict.get("regularized_propagation", False)
+    _reg_fold = reg_prop_dict.get("reg_parabola_focus", None)
+
     for ch_name in list(bundle.fields.keys()):
 
         F = bundle.fields[ch_name]                # ① current field
 
-        ######## REG and DEREG elements ########
+        ######## REG / DEREG / ZOOM elements ########
         if el_type == "zoom_window":
             zoom = el_dict.get("zoom", 1.0)
             F = zoom_window_with_interp(F, zoom)
             bundle.fields[ch_name] = F
             def_do_plot = 0
 
-        
-        if el_type == 'reg':  # regularize propagation
-            reg_prop_dict["regularized_propagation"] = True
-            if 'reg-by-f' in el_dict:
-                tmp = el_dict['reg-by-f']
+        if el_type == 'reg':  # (re)regularise propagation around a focus
+            # Reference focal length that sets the box-shrink schedule. REQUIRED.
+            # box scales as |reg_parabola_focus - z| / |reg_parabola_focus|, so the
+            # grid shrinks toward the reference focus and (for a converging beam)
+            # resolves the focal region at low N. A *negative* reg-by-f grows the
+            # box again (used just after a focus, the 'flip', to track divergence).
+            f_ref = yamlval('reg-by-f', el_dict, _reg_fold)
+            if f_ref is None:
+                print(f"  [reg] '{el_name}' has no 'reg-by-f' reference and no active "
+                      f"regularisation to inherit -> skipping (no regularisation applied).")
             else:
-                tmp = reg_prop_dict["reg_parabola_focus"]
-            F = Lens(F, -tmp)
-            bundle.fields[ch_name] = F
-
-            def_do_plot = 0
-
-        elif el_type == 'dereg':  # deregularize propagation
-            if not reg_prop_dict["regularized_propagation"]:
-                print("  You can't deregularize an already deregularized field!!!")
-            else:
-                reg_prop_dict["regularized_propagation"] = False
-                tmp = reg_prop_dict["reg_parabola_focus"]
-                F = Lens(F, reg_prop_dict["reg_parabola_focus"])
+                if _reg_was:
+                    # already regularised -> restore the physical field first, then
+                    # re-strip with the new reference (through-focus flip).
+                    F = Lens(F, _reg_fold)
+                F = Lens(F, -f_ref)                # strip reference phase -> reduced field
                 bundle.fields[ch_name] = F
-                
-            def_do_plot = 0
-        
-
-        if "reg-by-f" in el_dict:
-            f = el_dict['reg-by-f']
-            if reg_prop_dict["reg_parabola_focus"] is None:
-                reg_prop_dict["reg_parabola_focus"] = f
+                reg_prop_dict["reg_parabola_focus"]     = f_ref
                 reg_prop_dict["regularized_propagation"] = True
-                #print(f"Regularizing by CRL in {F_pos} by value {f}")
+            def_do_plot = 0
+
+        elif el_type == 'dereg':  # restore physical field, back to plain propagation
+            if not _reg_was:
+                print("  [dereg] field is not regularised; nothing to do.")
             else:
-                #for inserting second, that images the focus made by first CRL
-                if reg_prop_dict["regularized_propagation"] == True:
-                    f2_tmp = f
-                    #thin lens formula (zobrazovaci rovnice), where focus is the object
-                    reg_new_tmp = 1.0/(1.0/f2_tmp + 1.0/reg_prop_dict["reg_parabola_focus"])
-                    reg_prop_dict["reg_parabola_focus"] = reg_new_tmp
-                    print("Re-regularizing by CRL")
-                else:
-                    reg_prop_dict["reg_parabola_focus"] = f
-                    reg_prop_dict["regularized_propagation"] = True
-                    print("Unexpected regularizing by CRL")
+                F = Lens(F, _reg_fold)            # restore physical field
+                bundle.fields[ch_name] = F
+                reg_prop_dict["regularized_propagation"] = False
+                reg_prop_dict["reg_parabola_focus"]      = None
+            def_do_plot = 0
+
 
 
             ############# LENS ELEMENT ###############
@@ -5970,7 +6398,10 @@ def apply_element(bundle: FieldBundle,
         ############# ELEMENT : PURE APERTURE ###########
         if 'aperture' in el_type:
             # -----External_map shaping at the beam entrance ---
-            if el_dict.get('shape', '') == 'external_map':
+            # 'external_map'       → mask matches the external image intensity
+            # 'external_map+halo'  → external image + wide Gaussian halo
+            _shape_str = str(el_dict.get('shape', '')).replace(" ", "").lower()
+            if _shape_str in ('external_map', 'external_map+halo', 'external+halo'):
                 M = build_external_shaper_mask(el_dict, F, params)
                 F = MultIntensity(M, F)
                 bundle.fields[ch_name] = F
@@ -6428,29 +6859,41 @@ def main_VIBE(params,elements):
                 tau         = params.get('X_FWHM_duration')
 
                 if photons_tot:
-                    params['scale_phot'] = photons_tot / np.nansum(I_ch) / ((propsize / N)**2) # Factor to scale the map to photons/m^2. Unit is [photons / m^2]
+                    # Guard against a near-zero integrand at the reference
+                    # plane (which would otherwise blow scale_phot up to inf
+                    # and crash every downstream LogNorm colorbar).
+                    _sum_I  = float(np.nansum(I_ch))
+                    _dx2    = (propsize / N)**2
+                    _denom  = _sum_I * _dx2
+                    _thresh = 1e-30              # anything below ≈ numerical noise
+                    if _denom > _thresh and np.isfinite(_denom):
+                        params['scale_phot'] = photons_tot / _sum_I / _dx2
+                    else:
+                        params['scale_phot'] = 1.0
+                        print(f"[scale_phot] WARNING: reference-plane integrand "
+                              f"is essentially zero (∑I·dx²={_denom:.2e}); "
+                              f"falling back to scale_phot=1.0 (photons units disabled).")
                     print(f"scale photons {params['scale_phot']}")
-                    print(f"∑I_ch = {np.nansum(I_ch):.3e}")
-                    print(f"∑I_ch x dx^2 = {np.nansum(I_ch)*((propsize / N)**2):.3e}")
+                    print(f"∑I_ch = {_sum_I:.3e}")
+                    print(f"∑I_ch x dx^2 = {_denom:.3e}")
 
 
                 if photons_tot and tau:
                     E_J   = params['photon_energy'] * e
-                    params['scale_Wcm2'] = (photons_tot * E_J / tau) \
-                                        / np.nansum(I_ch) / propsize**2 / 1e4
+                    _sum_I2 = float(np.nansum(I_ch))
+                    _den2   = _sum_I2 * propsize**2
+                    if _den2 > 1e-30 and np.isfinite(_den2):
+                        params['scale_Wcm2'] = (photons_tot * E_J / tau) / _den2 / 1e4
+                    else:
+                        params['scale_Wcm2'] = 1.0
 
                     
-            # --- optional rectangular ROI integrals (for SFA labels) -------------
-            if 'roi' in el_dict and ch_name == "main":
-                s_um               = 0.5 * el_dict['roi']                 # half-width [µm]
-                mask               = np.abs(Na) <= s_um                   # Na is 1-D μm-axis
-                intensities['roi'] = (np.nansum(I_ch[np.ix_(mask, mask)])* propsize**2)
+            # --- optional rectangular ROI integrals ------------------------------
+            # NOTE: the ROI integration is now done as a POST-LOOP step in
+            # `_finalize_roi_integrations()` (after we have all Det_XXX images
+            # so that we can, if roi<=1, resolve the adaptive rectangle from
+            # the VB_perp FWHM at Det). The in-loop version has been removed.
 
-            if 'roi2' in el_dict and ch_name == "main":
-                s_um                = 0.5 * el_dict['roi2']
-                mask                = np.abs(Na) <= s_um
-                intensities['roi2'] = (np.nansum(I_ch[np.ix_(mask, mask)]) * propsize**2)
-                
             # ------ bookkeeping ---------------------------------------------------
             Iint = np.nansum(I_ch) * propsize**2            # Summed intensity
             intensities[f"{el_name}_{ch_name}"] = Iint      # e.g. "Det_main"
@@ -6541,11 +6984,20 @@ def main_VIBE(params,elements):
                 # Intensity unit selection
                 if unit_sel == 'photons':
                     scale_ph = params.get('scale_phot', 1.0)      # 1.0 if not defined yet
+                    # If scale_phot came out inf/NaN (e.g. because the reference
+                    # plane had essentially zero beam energy), silently fall
+                    # back to relative units for this panel rather than trying
+                    # to display inf-valued pixels (which crashes LogNorm).
+                    if not (isinstance(scale_ph, (int, float)) and np.isfinite(scale_ph) and scale_ph > 0):
+                        scale_ph = 1.0
                     vmin, vmax = [c * scale_ph for c in [1e-11, 50]]
                     label_unit = "photons / m²"
                     scale_plot = scale_ph
                 elif unit_sel == 'Wcm2':
-                    vmin, vmax = [c * params['scale_Wcm2'] for c in [1e-11, 50]]
+                    _sc_W = params.get('scale_Wcm2', 1.0)
+                    if not (isinstance(_sc_W, (int, float)) and np.isfinite(_sc_W) and _sc_W > 0):
+                        _sc_W = 1.0
+                    vmin, vmax = [c * _sc_W for c in [1e-11, 50]]
                     label_unit = "W cm⁻²"
                     scale_plot = 1.0
                 else:                             # relative
@@ -6560,6 +7012,10 @@ def main_VIBE(params,elements):
                 ax.set_facecolor("black")
 
                 im_plot = im * scale_plot
+                # Belt-and-braces: strip any inf/NaN pixels so LogNorm's
+                # auto-scale doesn't inherit non-finite limits from the data.
+                if not np.all(np.isfinite(im_plot)):
+                    im_plot = np.where(np.isfinite(im_plot), im_plot, 0.0)
 
                 # --- choose color limits ---
                 if mosaic_cbar_dynamic:
@@ -6582,6 +7038,15 @@ def main_VIBE(params,elements):
                     else:
                         vmin, vmax = base
 
+                # --- sanitize limits so LogNorm never gets vmin >= vmax
+                #     or non-finite values (this happens e.g. when a plane is
+                #     entirely zero, which crashes matplotlib's colorbar). --
+                _tiny = np.finfo(float).tiny
+                if not (np.isfinite(vmin) and vmin > 0):
+                    vmin = _tiny
+                if not (np.isfinite(vmax) and vmax > vmin):
+                    vmax = vmin * 10.0
+
                 # --- draw ---
                 half_span_m = 0.5 * propsize / ZoomFactor   # [m]
                 img = ax.imshow(
@@ -6589,7 +7054,7 @@ def main_VIBE(params,elements):
                     extent=[-half_span_m*1e6, +half_span_m*1e6,-half_span_m*1e6, +half_span_m*1e6],
                     origin='lower',
                     cmap=rofl.cmap(),
-                    norm=LogNorm(vmin=max(vmin, np.finfo(float).tiny), vmax=vmax) if logg else None
+                    norm=LogNorm(vmin=vmin, vmax=vmax) if logg else None
                 )
 
                 divider = make_axes_locatable(ax)
@@ -6604,17 +7069,23 @@ def main_VIBE(params,elements):
                 
                 # --------- Add the squares and Shadow factor on the Det pannel ----------
                 if ch_name == "main" and el_name == "Det":
-                    # draw the rectangles corresponding to the size of 1 camera pixel
-                    if 'roi2' in el_dict:                       # SFA-75 (green, larger box)
-                        s_um = 0.5 * el_dict['roi2']
-                        ax.add_patch(plt.Rectangle((-s_um, -s_um), 2*s_um, 2*s_um,
-                                                edgecolor='lime',  facecolor='none',
-                                                lw=1.3))
-                    if 'roi' in el_dict:                        # SFA-13 (red, smaller box)
-                        s_um = 0.5 * el_dict['roi']
-                        ax.add_patch(plt.Rectangle((-s_um, -s_um), 2*s_um, 2*s_um,
-                                                edgecolor='red',  facecolor='none',
-                                                lw=1.3))
+                    # draw the ROI rectangles. Sizes come from `intensities[..._box_m]`
+                    # (populated by the post-loop ROI finalisation) so that they are
+                    # correct whether we're in fixed-µm mode or in adaptive-frac mode.
+                    for _tag, _color in (("roi2", "lime"), ("roi", "red")):
+                        _box = intensities.get(f"{_tag}_box_m")
+                        if _box is None and _tag in el_dict:
+                            # Legacy fallback: draw square using the raw yaml µm value
+                            _v = float(el_dict[_tag])
+                            if _v > 1.0:
+                                _box = (_v * 1e-6, _v * 1e-6)
+                        if _box is None:
+                            continue
+                        rx_um = _box[0] * 1e6 / 2.0
+                        ry_um = _box[1] * 1e6 / 2.0
+                        ax.add_patch(plt.Rectangle((-rx_um, -ry_um), 2*rx_um, 2*ry_um,
+                                                   edgecolor=_color, facecolor='none',
+                                                   lw=1.3))
 
                     # text at bottom-left
                     central_key = "TCC_main" if "TCC_main" in intensities else (
@@ -6686,6 +7157,125 @@ def main_VIBE(params,elements):
     # make 'start' consistent with this normalization choice
     intensities['start'] = float(I0int)
 
+    # ------------------------------------------------------------------
+    # 6-bis. ROI integrations at the detector (post-loop, needs Det_* imgs)
+    # ------------------------------------------------------------------
+    # The two Det ROI boxes (roi, roi2) are sized according to Det.roi_mode:
+    #   'fixed'       → square box of `roi` µm per side
+    #   'containment' → smallest centred window enclosing fraction `roi`
+    #                   of the VB_perp signal integral (per axis)
+    #   'fwhm'        → `roi` × VB_perp FWHM (per axis)
+    #   (no roi_mode) → 'auto': roi>1 fixed-µm, 0<roi≤1 fwhm-fraction
+    #                   (backward compatible with pre-roi_mode yamls)
+    # The resulting integrals + rectangle dimensions land in `intensities`.
+    # ------------------------------------------------------------------
+    _det_dict = None
+    for _el in elements:
+        if _el[1] == "Det" and yamlval("in", _el[2], 1):
+            _det_dict = _el[2]
+            break
+
+    if _det_dict is not None and ("Det_main" in figs):
+        _roi_mode = str(_det_dict.get("roi_mode", "auto")).lower()
+
+        # Reference image driving the adaptive (containment / fwhm) boxes:
+        # the VB_perp Det image, falling back to the main Det image.
+        _img_ref = None; _dx_ref = None
+        if "Det_VB_perp" in figs:
+            _img_ref, _, _prop_ref, _ = figs["Det_VB_perp"]
+            _dx_ref = float(_prop_ref) / _img_ref.shape[0]
+        elif "Det_main" in figs:
+            _img_ref, _, _prop_ref, _ = figs["Det_main"]
+            _dx_ref = float(_prop_ref) / _img_ref.shape[0]
+
+        # FWHM of the reference image, computed once (used by 'fwhm'/'auto').
+        _fwhm_x_m = _fwhm_y_m = float("nan")
+        if _img_ref is not None:
+            _fwhm_x_m, _fwhm_y_m = fwhm_xy_of_image(_img_ref, _dx_ref)
+        if np.isfinite(_fwhm_x_m) and np.isfinite(_fwhm_y_m):
+            print(f"[ROI] mode={_roi_mode!r}; VB_perp FWHM = "
+                  f"{_fwhm_x_m*1e6:.2f} x {_fwhm_y_m*1e6:.2f} um")
+
+        # ---- resolve boxes for roi and roi2 -------------------------------
+        # When a key is absent we fall back to the legacy fixed-µm squares
+        # (roi=13 µm, roi2=75 µm) so the Shadow-Factor is always computed.
+        _roi_defaults = {"roi": 13.0, "roi2": 75.0}
+        for _tag in ("roi", "roi2"):
+            if _tag in _det_dict:
+                _val, _mode = _det_dict[_tag], _roi_mode
+            else:
+                _val, _mode = _roi_defaults[_tag], "fixed"
+            _res = resolve_roi_box(_val, _mode, image=_img_ref, dx_m=_dx_ref,
+                                   fwhm_x_m=_fwhm_x_m, fwhm_y_m=_fwhm_y_m)
+            if _res is None:
+                intensities[f"{_tag}_box_m"] = None
+                intensities[f"{_tag}_mode"]  = "invalid"
+                intensities[f"{_tag}_label"] = f"invalid ({_val!r})"
+                continue
+            rx, ry, mode = _res
+            intensities[f"{_tag}_box_m"] = (rx, ry)
+            intensities[f"{_tag}_mode"]  = mode
+            intensities[f"{_tag}_label"] = roi_label(rx, ry, mode)
+
+            # integrate for every channel available at Det
+            for _ch in ("main", "VB_parr", "VB_perp"):
+                _key_img = f"Det_{_ch}"
+                if _key_img not in figs:
+                    continue
+                _img_ch, _, _prop_ch, _ = figs[_key_img]
+                _dx_ch = float(_prop_ch) / _img_ch.shape[0]
+                val = integrate_rect(_img_ch, _dx_ch, rx, ry)
+                intensities[f"{_tag}_Det_{_ch}"] = val
+                if _ch == "main":
+                    # Legacy alias used by the Shadow-Factor computation
+                    # (SF = intensities['roi'] / intensities['TCC_main']).
+                    # `intensities['TCC_main']` and every other element-plane
+                    # bookkeeping value is stored in the legacy "sum × propsize²"
+                    # convention (see `Iint = np.nansum(I_ch) * propsize**2` in
+                    # the main loop). `integrate_rect` returns the correct
+                    # physical integral `sum × dx²`, which is N² times smaller.
+                    # Feeding it into the SF ratio without rescaling makes SF
+                    # underestimated by ~N² (≈1e7 for N=5000) — exactly the
+                    # 1e-9 → 1e-16 discrepancy we observed between the old
+                    # fixed-ROI code and the new adaptive-ROI path.
+                    _N_sq = (float(_prop_ch) / _dx_ch) ** 2   # = N² of Det_main
+                    intensities[_tag] = val * _N_sq
+
+        # ---- convenience aliases + SNR values -----------------------------
+        _bg_roi  = intensities.get("roi_Det_main")
+        _bg_roi2 = intensities.get("roi2_Det_main")
+        if _bg_roi  is not None: intensities["BG_roi"]  = _bg_roi
+        if _bg_roi2 is not None: intensities["BG_roi2"] = _bg_roi2
+
+        for _pol in ("VB_parr", "VB_perp"):
+            _vr  = intensities.get(f"roi_Det_{_pol}")
+            _vr2 = intensities.get(f"roi2_Det_{_pol}")
+            if _vr  is not None:
+                intensities[f"{_pol}_roi"]  = _vr
+                if _bg_roi  not in (None, 0):
+                    intensities[f"SNR_{_pol}_roi"]  = _vr  / _bg_roi
+            if _vr2 is not None:
+                intensities[f"{_pol}_roi2"] = _vr2
+                if _bg_roi2 not in (None, 0):
+                    intensities[f"SNR_{_pol}_roi2"] = _vr2 / _bg_roi2
+
+        _lbl_r  = intensities.get("roi_label",  "n/a")
+        _lbl_r2 = intensities.get("roi2_label", "n/a")
+        _keys_dump = [k for k in ("BG_roi", "BG_roi2",
+                                  "VB_parr_roi", "VB_parr_roi2",
+                                  "VB_perp_roi", "VB_perp_roi2",
+                                  "SNR_VB_parr_roi", "SNR_VB_parr_roi2",
+                                  "SNR_VB_perp_roi", "SNR_VB_perp_roi2") if k in intensities]
+        if _keys_dump:
+            print(f"[ROI at Det]  roi  box = {_lbl_r}   roi2 box = {_lbl_r2}")
+            print("[ROI/SNR values]  (relative intensity × m²;"
+                  " multiply by params['scale_phot'] for photons):")
+            for _k in _keys_dump:
+                print(f"    {_k:<18s} = {intensities[_k]:.4e}")
+    else:
+        # no Det block → skip ROI integration
+        pass
+
     # ──────────────────────────────────────────────────────────────────────
     # 7. stash results in params
     # ----------------------------------------------------------------------
@@ -6702,9 +7292,38 @@ def main_VIBE(params,elements):
     duration           = mu.print_times() # secondes
     params['duration'] = duration         # secondes
 
-    if np.size(figs)>0:
+    # -----------------------------------------------------------------
+    # Save the figs pickle.
+    #   save_pickle: 0   → don't keep it (cleanup will delete anyway).
+    #                      Still written here so downstream code has it
+    #                      during this run (e.g. flow_plot reload).
+    #   save_pickle: 1   → keep the FULL pickle (all planes + flow slices).
+    #   save_pickle: 2   → keep only the element PLANES (drop flow_XXX_*).
+    #                      Much lighter (a few MB instead of tens of GB)
+    #                      and lets you reload individual planes later.
+    # -----------------------------------------------------------------
+    _sp = params.get("save_pickle")
+    if _sp is None:
+        _sp = params.get("save_fig_and_pickle", 1)
+    try:
+        save_pickle_mode = int(_sp)
+    except Exception:
+        save_pickle_mode = 1
+
+    if np.size(figs) > 0:
         pkl_name = projectdir / "pickles" / f"{params['filename']}_figs"
+        # NOTE: for save_pickle_mode == 2 (planes-only) we still write the FULL
+        # pickle here so that flow_plot() -- which reloads the pickle from disk
+        # for every channel a few dozen lines below -- can find the dense
+        # flow_XXX_{channel} slices needed to build the main waterfall. The
+        # pickle is rewritten in slim form at the very end of main_VIBE, after
+        # every flow_plot / overlay has finished. See the "[save_pickle=2]
+        # Rewriting slim pickle" step below.
         mu.dumpPickle(figs, str(pkl_name))
+        if save_pickle_mode == 2:
+            print(f"[save_pickle=2] Full pickle written temporarily "
+                  f"({len(figs)} entries); will be trimmed to planes-only "
+                  f"after flow_plot / overlay complete.")
     if len(export)>0:
         pkl_name = projectdir / "pickles" / f"{params['filename']}_figs"
         mu.dumpPickle(figs, str(pkl_name))
@@ -6830,6 +7449,19 @@ def main_VIBE(params,elements):
             yaml_tag=params["filename"],
             save_units=params.get("intensity_units", "photons")
         )
+
+    # ---------------------------------------------------------------
+    # 10. save_pickle == 2  →  now that every flow_plot / overlay has
+    #     completed, rewrite the on-disk pickle in planes-only form
+    #     (drop all flow_XXX_{channel} slices to reclaim disk space).
+    # ---------------------------------------------------------------
+    if save_pickle_mode == 2 and np.size(figs) > 0:
+        pkl_name  = projectdir / "pickles" / f"{params['filename']}_figs"
+        figs_slim = {k: v for k, v in figs.items() if not str(k).startswith("flow_")}
+        n_drop    = len(figs) - len(figs_slim)
+        print(f"[save_pickle=2] Rewriting slim pickle → "
+              f"{len(figs_slim)} entries kept, {n_drop} flow slices dropped")
+        mu.dumpPickle(figs_slim, str(pkl_name))
 
 
 
@@ -7192,9 +7824,16 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Run VIBE directly from a YAML.")
     ap.add_argument("--yaml", required=True, help="Path to YAML config")
-    ap.add_argument("-N", type=int, default=1000, help="Number of simulation points")
+    ap.add_argument("-N", type=int, default=None, help="(legacy) grid size N; prefer --resolution")
+    ap.add_argument("--resolution", default=None,
+                    help="Resolution: value >10 = N grid cells, <=10 = um/pixel. "
+                         "Overrides simulation.Resolution in the YAML; 'None' -> use the YAML value.")
     args = ap.parse_args()
 
-    run_from_yaml(args.yaml, args.N)
+    res_cli = None
+    if args.resolution is not None and str(args.resolution).strip().lower() != "none":
+        res_cli = float(args.resolution)
+
+    run_from_yaml(args.yaml, resolution_cli=res_cli, N=args.N)
 
 
