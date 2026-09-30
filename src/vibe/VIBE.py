@@ -50,6 +50,48 @@ from LightPipes import *
 
 
 # =========================================================
+# Multithreaded FFT backend
+# =========================================================
+# numpy.fft is single-threaded AND silently upcasts complex64 -> complex128;
+# pyfftw keeps complex64 and threads the transform. Both LightPipes
+# (Forvard/Fresnel) and vibe.regularized_propagation_v2.Forvard_reg do
+# `from numpy.fft import fft2` at CALL time when _USE_PYFFTW is False, so
+# monkeypatching numpy.fft here accelerates every propagation without touching
+# those modules. Thread count defaults to the job's CPU allocation
+# (SLURM_CPUS_PER_TASK); override with VIBE_FFT_THREADS. If pyfftw is not
+# installed (e.g. a laptop), this is a no-op and numpy.fft is used unchanged.
+def _enable_threaded_fft():
+    n_threads = int(os.environ.get("VIBE_FFT_THREADS",
+                                   os.environ.get("SLURM_CPUS_PER_TASK", "1")))
+    planner = os.environ.get("VIBE_FFT_PLANNER", "FFTW_MEASURE")
+    try:
+        import pyfftw
+    except ImportError:
+        return  # no pyfftw -> plain numpy.fft (unchanged behaviour)
+    import functools
+    pyfftw.interfaces.cache.enable()
+    pyfftw.interfaces.cache.set_keepalive_time(300)
+    _pf = pyfftw.interfaces.numpy_fft
+
+    def _wrap(fn):
+        @functools.wraps(fn)
+        def inner(*args, **kw):
+            kw.setdefault("threads", n_threads)
+            kw.setdefault("planner_effort", planner)
+            return fn(*args, **kw)
+        return inner
+
+    for _name in ("fft2", "ifft2", "fft", "ifft", "fftn", "ifftn"):
+        try:
+            setattr(np.fft, _name, _wrap(getattr(_pf, _name)))
+        except Exception:
+            pass
+    print(f"[VIBE] pyfftw FFT enabled: threads={n_threads}, planner={planner}.")
+
+_enable_threaded_fft()
+
+
+# =========================================================
 # Plotting / image I/O (headless-safe)
 # =========================================================
 import matplotlib
@@ -570,9 +612,13 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
     # - remove planes/<filename>/* if not keeping "individual"
     # - remove flows/<filename>_flowfig_* and flows/<filename>_slice_* if you use those
     planes_dir = Path(projectdir) / "planes" / filename
+    # keep the planes/ dir if ANY plane-export token is present (individual /
+    # all_flowplot_planes / video all write here — including the encoded video)
+    keep_planes = keep_individual or ("all_flowplot_planes" in keep) or ("video" in keep)
+    if not keep_planes:
+        patterns += [str(planes_dir / "*")]
     if not keep_individual:
         patterns += [
-            str(planes_dir / "*"),
             str(flow_dir / f"{filename}_flowfig*"),
             str(flow_dir / f"{filename}_slice*"),
         ]
@@ -2762,6 +2808,65 @@ def roi_label(rect_x_m, rect_y_m, mode):
     return f"{x_um:.1f}×{y_um:.1f} µm ({mode})"
 
 
+def optimize_roi3_nshots(signal_img, bg_img, dx_m, *,
+                         pol_purity=1e-5, z=1.0, fano=1.0,
+                         n_scan=30, frac_lo=0.2, frac_hi=3.0):
+    """Centred rectangular Det ROI that MINIMISES the shots-to-`z`σ VB_perp
+    detection (perp channel: background suppressed by `pol_purity`).
+
+    The box is centred on the grid (same convention as `integrate_rect`). Its
+    width and height are scanned INDEPENDENTLY over `n_scan × n_scan` points
+    from `frac_lo × FWHM` to `frac_hi × FWHM` (FWHM taken from `signal_img`).
+    For each candidate box:
+
+        S      = ∫ signal     over the box            (VB_perp photons)
+        B_eff  = pol_purity × ∫ background over the box
+        N_shot = z² (S + 2·fano·B_eff) / S²           (1σ shots, equal ON/OFF)
+
+    `signal_img` / `bg_img` should already be in the desired photon units so
+    the returned `nshots` is a real shot count (the argmin box is unchanged by
+    a common scale, but the reported N is not).
+
+    Returns {box_m:(rx,ry), nshots, label, fwhm_m:(fx,fy), S, BG_raw} or None
+    if the signal FWHM / peak is unusable.
+    """
+    sig = np.asarray(signal_img, dtype=np.float64)
+    bg  = np.asarray(bg_img, dtype=np.float64) if bg_img is not None else None
+    fx, fy = fwhm_xy_of_image(sig, dx_m)
+    if not (np.isfinite(fx) and np.isfinite(fy) and fx > 0 and fy > 0):
+        return None
+
+    widths  = np.linspace(frac_lo * fx, frac_hi * fx, int(n_scan))
+    heights = np.linspace(frac_lo * fy, frac_hi * fy, int(n_scan))
+
+    best = None                       # (nshots, rx, ry, S, BG_raw)
+    z2 = float(z) * float(z)
+    for ry in heights:
+        for rx in widths:
+            S = integrate_rect(sig, dx_m, rx, ry)
+            if not (np.isfinite(S) and S > 0):
+                continue
+            BG_raw = integrate_rect(bg, dx_m, rx, ry) if bg is not None else 0.0
+            if not np.isfinite(BG_raw):
+                BG_raw = 0.0
+            B_eff  = float(pol_purity) * BG_raw
+            nshots = z2 * (S + 2.0 * float(fano) * B_eff) / (S * S)
+            if best is None or nshots < best[0]:
+                best = (nshots, float(rx), float(ry), float(S), float(BG_raw))
+
+    if best is None:
+        return None
+    nshots, rx, ry, S, BG_raw = best
+    return {
+        "box_m":  (rx, ry),
+        "nshots": float(nshots),
+        "label":  f"{rx*1e6:.1f}×{ry*1e6:.1f}µm opt",
+        "fwhm_m": (float(fx), float(fy)),
+        "S":      float(S),
+        "BG_raw": float(BG_raw),
+    }
+
+
 def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertical_type='center', log=1, xl=None, flow_figs=0, flow_plot_crange=1e-5, channel="main", include_flow=True, unit=None):
     """
     Visualizes 2D flow maps along z, with optional export for movie making.
@@ -3202,8 +3307,39 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
     box_roi_x , box_roi_y , label_roi  = _get_box("roi")
     box_roi2_x, box_roi2_y, label_roi2 = _get_box("roi2")
-    roi_specs  = (("roi",  box_roi_x,  box_roi_y,  label_roi),
-                  ("roi2", box_roi2_x, box_roi2_y, label_roi2))
+    roi_specs  = [("roi",  box_roi_x,  box_roi_y,  label_roi),
+                  ("roi2", box_roi2_x, box_roi2_y, label_roi2)]
+
+    # ─── ROI3: N-shots-optimal Det ROI (perp channel, purity 1e-5, 1σ) ────
+    # Scan the box width/height (30×30, 0.2–3× the VB_perp FWHM) and keep the
+    # box that MINIMISES the shots-to-1σ. Computed from the Det 2-D maps in
+    # the pickle, so a plain re-plot picks it up (no re-sim of the field).
+    # Adds a third table column + summary fields (roi3_*).
+    roi3_info  = None
+    label_roi3 = None
+    try:
+        if ("Det_VB_perp" in pic) and ("Det_main" in pic):
+            _s_img, _, _s_prop, _ = pic["Det_VB_perp"]
+            _b_img, _, _b_prop, _ = pic["Det_main"]
+            _dx3 = float(_s_prop) / _s_img.shape[0]
+            if unit_sel == "photons":
+                _s_sc, _b_sc = _s_img * scale_ph,  _b_img * scale_ph
+            elif unit_sel == "Wcm2":
+                _s_sc, _b_sc = _s_img * scale_Wcm, _b_img * scale_Wcm
+            else:
+                _s_sc, _b_sc = _s_img, _b_img
+            roi3_info = optimize_roi3_nshots(_s_sc, _b_sc, _dx3,
+                                             pol_purity=1e-5, z=1.0, fano=1.0)
+            if roi3_info is not None:
+                _r3x, _r3y = roi3_info["box_m"]
+                label_roi3 = roi3_info["label"]
+                roi_specs.append(("roi3", _r3x, _r3y, label_roi3))
+                print(f"[ROI3] optimum box = {label_roi3}  "
+                      f"N-shots(1σ, perp 1e-5) = {roi3_info['nshots']:.3e}")
+    except Exception:
+        import traceback
+        print("[ROI3] CRASH during optimum-ROI computation!")
+        traceback.print_exc()
 
     # ─── VB SIGNAL (Detector photon count) ───────────────────────────
     VB_photons = {}   # {'VB_parr': {'roi': v, 'roi2': v}, ...}   (string keys)
@@ -3275,7 +3411,7 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     SNR = {}
     if VB_photons and BG_photons:
         for pol in ["VB_parr", "VB_perp"]:
-            for tag in ("roi", "roi2"):
+            for tag, *_ in roi_specs:
                 vb_val = VB_photons.get(pol, {}).get(tag, np.nan)
                 bg_val = BG_photons.get(tag, np.nan)
                 if np.isfinite(vb_val) and np.isfinite(bg_val) and bg_val != 0:
@@ -3286,47 +3422,72 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     # ─── TABLE OF RESULTS ON THE PLOT ───────────────────────────────────
     if has_flow:  # only draw the table when a flow plot exists
         ax = plt.gca()
+
+        # Label-column + numeric-column widths. The table adapts to 2 or 3 ROI
+        # columns; roi3 (the N-shots-optimal box) is shown only when present.
+        _W  = 18
+        _CW = 18
+        _cols = [("roi", label_roi), ("roi2", label_roi2)]
+        if roi3_info is not None and label_roi3 is not None:
+            _cols.append(("roi3", label_roi3))
+
+        def _cell(v):
+            # float → scientific; anything else (labels, 'n/a') → right-justified str
+            if isinstance(v, str):
+                return f"{v:>{_CW}}"
+            return f"{v:>{_CW}.2e}"
+
+        def _row(name, vals):
+            return f"{name:<{_W}} | " + " | ".join(_cell(v) for v in vals)
+
         text_lines = []
+        text_lines.append(_row("Quantity", [lbl for _, lbl in _cols]))
+        text_lines.append("-" * (_W + len(_cols) * (3 + _CW)))
 
-        # ---- column headers use the actual box dimensions --------------
-        col_r  = label_roi
-        col_r2 = label_roi2
-        text_lines.append(f"{'Quantity':<10} | {col_r:>18} | {col_r2:>18}")
-        text_lines.append("-" * (10 + 3 + 18 + 3 + 18))
+        # Shadow factors (roi/roi2 only; roi3 has no SF)
+        _sf = {"roi": t13, "roi2": t75}
+        text_lines.append(_row("SF", [_sf.get(tag, "n/a") for tag, _ in _cols]))
 
-        # Shadow factors (always available)
-        text_lines.append(f"{'SF':<10} | {t13:>18.2e} | {t75:>18.2e}")
-
-        # --- VB photon counts (if available) ---
-        if 'VB_parr' in VB_photons or 'VB_perp' in VB_photons:
-            VB_parr_r  = VB_photons.get('VB_parr', {}).get('roi',  np.nan)
-            VB_parr_r2 = VB_photons.get('VB_parr', {}).get('roi2', np.nan)
-            VB_perp_r  = VB_photons.get('VB_perp', {}).get('roi',  np.nan)
-            VB_perp_r2 = VB_photons.get('VB_perp', {}).get('roi2', np.nan)
-
-            text_lines.append(f"{'VB||':<10} | {VB_parr_r:>18.2e} | {VB_parr_r2:>18.2e}")
-            text_lines.append(f"{'VB⊥':<10} | {VB_perp_r:>18.2e} | {VB_perp_r2:>18.2e}")
+        # VB photon counts
+        _has_vb = ('VB_parr' in VB_photons) or ('VB_perp' in VB_photons)
+        def _vb(pol, tag):
+            return VB_photons.get(pol, {}).get(tag, np.nan)
+        if _has_vb:
+            text_lines.append(_row("VB||", [_vb("VB_parr", tag) for tag, _ in _cols]))
+            text_lines.append(_row("VB⊥",  [_vb("VB_perp", tag) for tag, _ in _cols]))
         else:
-            text_lines.append(f"{'VB||':<10} | {'n/a':>18} | {'n/a':>18}")
-            text_lines.append(f"{'VB⊥':<10} | {'n/a':>18} | {'n/a':>18}")
+            text_lines.append(_row("VB||", ["n/a"] * len(_cols)))
+            text_lines.append(_row("VB⊥",  ["n/a"] * len(_cols)))
 
-        # --- Background photons (always computed) ---
-        BG_r  = BG_photons.get('roi',  np.nan)
-        BG_r2 = BG_photons.get('roi2', np.nan)
-        text_lines.append(f"{'BG':<10} | {BG_r:>18.2e} | {BG_r2:>18.2e}")
+        # Background photons
+        text_lines.append(_row("BG", [BG_photons.get(tag, np.nan) for tag, _ in _cols]))
 
-        # --- SNR (only if VB present) ---
+        # SNR
         if SNR:
-            SNR_parr_r  = SNR.get(('VB_parr', 'roi'),  np.nan)
-            SNR_parr_r2 = SNR.get(('VB_parr', 'roi2'), np.nan)
-            SNR_perp_r  = SNR.get(('VB_perp', 'roi'),  np.nan)
-            SNR_perp_r2 = SNR.get(('VB_perp', 'roi2'), np.nan)
-
-            text_lines.append(f"{'SNR||':<10} | {SNR_parr_r:>18.2e} | {SNR_parr_r2:>18.2e}")
-            text_lines.append(f"{'SNR⊥':<10} | {SNR_perp_r:>18.2e} | {SNR_perp_r2:>18.2e}")
+            text_lines.append(_row("SNR||", [SNR.get(("VB_parr", tag), np.nan) for tag, _ in _cols]))
+            text_lines.append(_row("SNR⊥",  [SNR.get(("VB_perp", tag), np.nan) for tag, _ in _cols]))
         else:
-            text_lines.append(f"{'SNR||':<10} | {'n/a':>18} | {'n/a':>18}")
-            text_lines.append(f"{'SNR⊥':<10} | {'n/a':>18} | {'n/a':>18}")
+            text_lines.append(_row("SNR||", ["n/a"] * len(_cols)))
+            text_lines.append(_row("SNR⊥",  ["n/a"] * len(_cols)))
+
+        # --- N-shots to reach 1 sigma (z=1, FANO=1), PERP channel ---
+        #   N = (S + 2*B_eff)/S^2   with  B_eff = BG_raw * pol_purity  (equal ON/OFF shots).
+        #   line 1: pol_purity = 1e-5, full signal (roi3 is chosen to MINIMISE this).
+        #   line 2: pol_purity = 1e-7, signal 4x weaker (S -> S/4).
+        def _nshots_1sig(S, BG_raw, pol_purity, sig_factor=1.0):
+            if not (np.isfinite(S) and S > 0):
+                return np.nan
+            Seff = S * sig_factor
+            if Seff <= 0:
+                return np.nan
+            Beff = BG_raw * pol_purity if np.isfinite(BG_raw) else 0.0
+            return (Seff + 2.0 * Beff) / Seff**2
+
+        def _ns_vals(pol_purity, sig_factor):
+            return [_nshots_1sig(_vb("VB_perp", tag), BG_photons.get(tag, np.nan),
+                                 pol_purity, sig_factor) for tag, _ in _cols]
+        text_lines.append(_row("N-shots(1e-5)",     _ns_vals(1e-5, 1.0)))
+        text_lines.append(_row("N-shots(1e-7,S/4)", _ns_vals(1e-7, 0.25)))
 
         # Draw the text box
         table_text = "\n".join(text_lines)
@@ -3424,6 +3585,11 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         "roi2_box_m": (box_roi2_x, box_roi2_y),
         "roi_label":  label_roi,
         "roi2_label": label_roi2,
+        # ---- roi3: N-shots-optimal box (perp 1e-5, 1σ) ----------------
+        "roi3_box_m":  (roi3_info["box_m"]  if roi3_info is not None else None),
+        "roi3_label":  (label_roi3          if roi3_info is not None else None),
+        "roi3_nshots": (roi3_info["nshots"] if roi3_info is not None else None),
+        "roi3_fwhm_m": (roi3_info["fwhm_m"] if roi3_info is not None else None),
     }
 
     save_kwargs = dict(
@@ -3846,6 +4012,207 @@ def save_individual_plane_figures(project_dir, yaml_tag, *, save_units="photons"
         print(f"[save_planes] saved: {out_file}")
 
     print("[save_planes] DONE exporting all individual planes.")
+
+
+# ======================================================================
+#  Robust frame-sequence -> video (mp4 via OpenCV, animated-GIF fallback)
+# ======================================================================
+def _write_frames_video(frame_paths, out_base, fps=10):
+    """Encode an ordered list of PNG frames into a video.
+
+    Tries mp4 first (OpenCV 'mp4v', which ships its own codecs so no external
+    ffmpeg binary is needed); if that backend is unavailable it falls back to an
+    animated GIF (imageio/Pillow). Returns the written path, or None on failure.
+    """
+    import os
+    import imageio.v2 as imageio
+
+    frames = []
+    for p in frame_paths:
+        try:
+            frames.append(imageio.imread(p))
+        except Exception:
+            pass
+    if not frames:
+        return None
+
+    # unify to a common, even-sized RGB canvas (mp4 codecs require even dims)
+    h = min(f.shape[0] for f in frames)
+    w = min(f.shape[1] for f in frames)
+    h -= h % 2
+    w -= w % 2
+    frames = [f[:h, :w, :3] for f in frames]
+    fps = max(int(fps), 1)
+
+    # 1) mp4 via OpenCV
+    try:
+        import cv2
+        out_mp4 = f"{out_base}.mp4"
+        vw = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
+                             float(fps), (w, h))
+        if not vw.isOpened():
+            raise RuntimeError("cv2.VideoWriter failed to open")
+        for f in frames:
+            vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+        vw.release()
+        if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+            return out_mp4
+        raise RuntimeError("cv2 produced an empty file")
+    except Exception as _e:
+        print(f"[video] mp4 backend unavailable ({_e}); writing GIF instead")
+
+    # 2) GIF fallback
+    out_gif = f"{out_base}.gif"
+    try:
+        imageio.mimsave(out_gif, frames, duration=1.0 / fps)
+        return out_gif
+    except Exception as _e:
+        print(f"[video] GIF fallback failed: {_e}")
+        return None
+
+
+# ======================================================================
+#  Export plane images (+ optional flow video) from the in-memory figs
+#     -> <project_dir>/planes/<yaml_tag>/
+#  Driven by simulation.save_figures tokens:
+#     'individual'          -> principal (non-flow) planes  (e.g. TCC, A1, Det)
+#     'all_flowplot_planes' -> every flow slice through z   (per channel)
+#     'video'               -> z-ordered video from the flow slices
+#  If 'video' is set WITHOUT 'all_flowplot_planes', the frames are rendered,
+#  encoded into the video, then deleted (only the video is kept).
+# ======================================================================
+def export_plane_images(figs, params, *, save_units="photons",
+                        want_individual=False, want_flow_images=False,
+                        want_video=False):
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+    from matplotlib.colors import LogNorm
+
+    tag         = params["filename"]
+    project_dir = params["projectdir"]
+    out_dir     = Path(project_dir) / "planes" / tag
+    mu.mkdir(str(out_dir), 0)
+    print(f"[planes] export dir: {out_dir}")
+
+    # intensity scaling -> physical units (mirrors save_individual_plane_figures)
+    scale_ph   = params.get("scale_phot", 1.0)
+    scale_Wcm2 = params.get("scale_Wcm2", 1.0)
+    if save_units == "photons":
+        scale, unit_label = scale_ph, "photons / m$^2$"
+    elif save_units == "Wcm2":
+        scale, unit_label = scale_Wcm2, "W / m$^2$"
+    else:
+        scale, unit_label = 1.0, "a.u."
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+
+    # individual_fig_log: 0 -> linear only, 1 -> log only, 2 -> BOTH (two image
+    # sets and, when video is on, two videos: one linear + one log)
+    ind_mode = int(params.get("individual_fig_log", 1) or 0)
+    if ind_mode == 2:
+        scales = [("lin", False), ("log", True)]
+    elif ind_mode == 1:
+        scales = [("log", True)]
+    else:
+        scales = [("lin", False)]
+    both = (len(scales) > 1)
+    fps      = int(params.get("flow_video_fps", 10))
+
+    _CH = ("main", "VB_parr", "VB_perp")
+    def _channel_of(key):
+        for suf in _CH:
+            if str(key).endswith("_" + suf):
+                return suf
+        return None
+
+    def _render(img2d, propsize, z, title, out_file, log, vmax=None):
+        img = np.asarray(img2d, dtype=float) * scale
+        extent = (-propsize / 2 * 1e6, propsize / 2 * 1e6,
+                  -propsize / 2 * 1e6, propsize / 2 * 1e6)
+        fig = plt.figure(figsize=(8, 6.5))
+        if log:
+            pos = img[img > 0]
+            hi  = vmax if (vmax is not None) else (float(np.nanmax(pos)) if pos.size else 1.0)
+            hi  = hi if (np.isfinite(hi) and hi > 0) else 1.0
+            im_plot = plt.imshow(np.clip(img, 1e-30, None), cmap=rofl.cmap(),
+                                 origin="lower", extent=extent, aspect="equal",
+                                 norm=LogNorm(vmin=max(hi * 1e-5, 1e-30), vmax=hi))
+        else:
+            hi = vmax if (vmax is not None) else (float(np.nanmax(img)) if img.size else 1.0)
+            hi = hi if (np.isfinite(hi) and hi > 0) else 1.0
+            im_plot = plt.imshow(np.clip(img, 0, None), cmap=rofl.cmap(),
+                                 origin="lower", extent=extent, aspect="equal",
+                                 vmin=0.0, vmax=hi)
+        plt.colorbar(im_plot, label=f"Intensity [{unit_label}]")
+        plt.xlabel("x [µm]"); plt.ylabel("y [µm]"); plt.title(title)
+        plt.tight_layout()
+        fig.savefig(out_file, dpi=150)
+        plt.close(fig)
+
+    # ---------------- principal (non-flow) planes ----------------
+    if want_individual:
+        n = 0
+        for key, data in figs.items():
+            if str(key).startswith("flow"):
+                continue
+            try:
+                img, propsize, z = data[0], float(data[2]), float(data[3])
+            except Exception:
+                print(f"[planes] skip malformed entry '{key}'")
+                continue
+            for sfx, log in scales:
+                note = f" ({sfx})" if both else ""
+                fn   = f"{key}_{sfx}.png" if both else f"{key}.png"
+                _render(img, propsize, z, f"{tag} — {key}{note}", out_dir / fn, log)
+            n += 1
+        print(f"[planes] saved {n} principal-plane(s) × {len(scales)} scale(s)")
+
+    # ---------------- flow planes (+ optional video) — MAIN channel only ------
+    #   VB channels are exported at the principal planes above, but NOT as flow
+    #   slices and NOT as a flow video.
+    if want_flow_images or want_video:
+        made = {}       # (channel, scale-suffix) -> [frame paths]
+        for suf in ("main",):
+            entries = [(k, v) for k, v in figs.items()
+                       if str(k).startswith("flow") and _channel_of(k) == suf]
+            if not entries:
+                print(f"[planes] no flow slices for channel '{suf}' — skipping")
+                continue
+            entries.sort(key=lambda kv: float(kv[1][3]))          # z small -> large
+            for sfx, log in scales:
+                note = f" ({sfx})" if both else ""
+                stag = f"{suf}_{sfx}" if both else f"{suf}"
+                paths = []
+                for i, (k, v) in enumerate(entries):
+                    propsize, z = float(v[2]), float(v[3])
+                    fp = out_dir / f"flowplane_{stag}_{i:04d}_z{z:+08.3f}m.png"
+                    # vmax=None -> each plane autoscales to its own full dynamic range
+                    _render(v[0], propsize, z, f"{tag} — {suf}{note}   z = {z:+.3f} m",
+                            fp, log)
+                    paths.append(fp)
+                made[(suf, sfx)] = paths
+                print(f"[planes] saved {len(paths)} flow-plane image(s) [{suf}/{sfx}]")
+
+        if want_video:
+            for (suf, sfx), paths in made.items():
+                base = f"{tag}_flow_{suf}_{sfx}" if both else f"{tag}_flow_{suf}"
+                vpath = _write_frames_video([str(p) for p in paths],
+                                            str(out_dir / base), fps=fps)
+                if vpath:
+                    print(f"[video] wrote {vpath}")
+
+        # video-only: keep the encoded video(s), drop the intermediate frames
+        if want_video and not want_flow_images:
+            n_del = 0
+            for paths in made.values():
+                for p in paths:
+                    try:
+                        os.remove(p); n_del += 1
+                    except Exception:
+                        pass
+            print(f"[video] removed {n_del} intermediate flow-plane image(s) (video kept)")
 
 
 
@@ -6651,15 +7018,23 @@ def main_VIBE(params,elements):
     if 'flow' in params:
         flowdef=params['flow']
         flowposs= None
+
+        def _flow_positions(z0, z1, third):
+            # third > 9  -> total NUMBER of flow planes (linspace, endpoints included)
+            # third <= 9 -> STEP [m] between planes (np.arange, legacy behaviour)
+            if float(third) > 9:
+                return np.linspace(float(z0), float(z1), int(round(float(third))))
+            return np.arange(z0, z1, third)
+
         if np.ndim(flowdef)==2:
             flowposs=np.array([])
             for r in np.arange(np.shape(flowdef)[0]):
                 ff=flowdef[r]
-                flowp1=np.arange(ff[0],ff[1],ff[2])
+                flowp1=_flow_positions(ff[0],ff[1],ff[2])
                 flowposs=np.concatenate((flowposs,flowp1))
 
         if np.size(flowdef)==3:
-            flowposs=np.arange(flowdef[0],flowdef[1],flowdef[2])
+            flowposs=_flow_positions(flowdef[0],flowdef[1],flowdef[2])
         if flowposs is not None:
             for fi,flowpos in enumerate(flowposs):
                 fe={}
@@ -6706,6 +7081,14 @@ def main_VIBE(params,elements):
 
     figs_to_save = yamlval('figs_to_save',params,[])
     figs_to_export = yamlval('figs_to_export',params,[])
+
+    # plane-image / flow-video export tokens (simulation.save_figures); these force
+    # the matching planes to be kept in `figs` so export_plane_images() can render
+    # them even when figs_to_save does not list every plane.
+    _sf_raw = params.get("save_figures", None)
+    _sf_tokens = {str(s).strip().lower() for s in _sf_raw} if isinstance(_sf_raw, (list, tuple)) else set()
+    _export_individual = ("individual" in _sf_tokens) or bool(int(params.get("save_individual_figures", 0) or 0))
+    _export_flow_imgs  = ("all_flowplot_planes" in _sf_tokens) or ("video" in _sf_tokens)
 
     figs = {}       # Definition of the pickle "figs"
     export = {}
@@ -6950,17 +7333,18 @@ def main_VIBE(params,elements):
                 normalize=(unit_sel == 'relative')  # only normalize in relative mode
             )
 
-            # --------------------------------------------------------------
-            # Always keep *every* automatic flow slice for *all* channels
-            if el_name.startswith("flow") and "flow" in figs_to_save:
-                figs[f"{el_name}_{ch_name}"] = [im, ei, propsize/ZoomFactor, z]
-            # --------------------------------------------------------------
-
-
-            # ---- auto-save figs / flow images ----
+            # ---- keep planes in `figs` for the pickle + plane-image export ----
+            #   flow slices      : kept if figs_to_save lists 'flow' OR the export
+            #                      wants flow images / a video
+            #   principal planes : kept if their name is in figs_to_save OR the
+            #                      export wants individual planes
             key = f"{el_name}_{ch_name}"
-            if el_name.startswith(tuple(figs_to_save)):
-                figs[key] = [im, ei, propsize/ZoomFactor, z]
+            if el_name.startswith("flow"):
+                if ("flow" in figs_to_save) or _export_flow_imgs:
+                    figs[key] = [im, ei, propsize/ZoomFactor, z]
+            else:
+                if el_name.startswith(tuple(figs_to_save)) or _export_individual:
+                    figs[key] = [im, ei, propsize/ZoomFactor, z]
             if fi is not None:
                 flow_savefig(I_ch, ffdir, fi, propsize, f"{params['filename']}_{ch_name}", position)
 
@@ -7442,13 +7826,23 @@ def main_VIBE(params,elements):
     # ---------------------------------------------------------------
     # 9. OPTIONAL: Save individual plane images (YAML controlled)
     # ---------------------------------------------------------------
-    if params.get("save_individual_figures", 0):
-        print("[save_planes] Saving individual figures…")
-        save_individual_plane_figures(
-            project_dir=params["projectdir"],
-            yaml_tag=params["filename"],
-            save_units=params.get("intensity_units", "photons")
-        )
+    _sf_raw = params.get("save_figures", None)
+    _sf_tokens = {str(s).strip().lower() for s in _sf_raw} if isinstance(_sf_raw, (list, tuple)) else set()
+    _want_individual = ("individual" in _sf_tokens) or bool(int(params.get("save_individual_figures", 0) or 0))
+    _want_flow_imgs  = ("all_flowplot_planes" in _sf_tokens)
+    _want_video      = ("video" in _sf_tokens)
+    if _want_individual or _want_flow_imgs or _want_video:
+        print("[planes] Exporting plane images / video …")
+        try:
+            export_plane_images(
+                figs, params,
+                save_units=params.get("intensity_units", "photons"),
+                want_individual=_want_individual,
+                want_flow_images=_want_flow_imgs,
+                want_video=_want_video,
+            )
+        except Exception as _e:
+            print(f"[planes] export failed: {_e}")
 
     # ---------------------------------------------------------------
     # 10. save_pickle == 2  →  now that every flow_plot / overlay has

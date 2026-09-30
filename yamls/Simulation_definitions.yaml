@@ -234,6 +234,22 @@ Det:                                 # Detector plane where the total number of 
   # the Det panel, shown in the flow_plot table (column headers), and stored
   # in the summary .npz meta as `roi_box_m`, `roi2_box_m`, `roi_label`,
   # `roi2_label`. The label carries the mode tag (e.g. "62.5×18.5 µm (cont50)").
+  #
+  #   roi3 (AUTOMATIC — no yaml key)  → the N-SHOTS-OPTIMAL box. At the detector
+  #                            plane the code scans the box width and height
+  #                            INDEPENDENTLY over a 30×30 grid from 0.2× to 3×
+  #                            the VB_perp FWHM and, for each candidate box,
+  #                            computes the number of shots to reach a 1σ
+  #                            VB_perp detection in the PERP channel (background
+  #                            suppressed by 1e-5, FANO=1):
+  #                                N = (S + 2·B_eff)/S² ,  B_eff = 1e-5 · BG.
+  #                            The box that MINIMISES N is reported as a third
+  #                            table column and stored in the summary meta as
+  #                            `roi3_box_m`, `roi3_label`, `roi3_nshots`,
+  #                            `roi3_fwhm_m`. Computed from the Det 2-D maps, so
+  #                            a plain flow_plot re-plot regenerates it (no
+  #                            re-simulation needed as long as the pickle still
+  #                            holds the detector planes).
   roi_mode: containment              # fixed | containment | fwhm  (omit → auto)
   roi: 0.5                           # containment: 50 % of the VB_perp signal
   roi2: 0.9                          # containment: 90 % of the VB_perp signal
@@ -332,9 +348,18 @@ simulation:                          # General simulation parameters
                                      # intensities dict) and the per-channel *_summary.npz files are
                                      # kept — those already contain BG/VB/SNR scalars and the ±500 µm
                                      # Det_main crop, so most downstream analysis works with save_pickle=2.
-  save_figures: [individual, flowplot, overlay, mosaic, transmission, lens, vb]
-                                     # Which figure categories survive the cleanup. Case-insensitive tokens:
-                                     #   individual     → per-plane images in planes/<sim>/
+  save_figures: [individual, flowplot, overlay, mosaic, transmission, lens, vb, all_flowplot_planes, video]
+                                     # Which figure categories survive the cleanup (and which plane exports
+                                     # are generated). Case-insensitive tokens:
+                                     #   individual          → per-plane images of the PRINCIPAL (non-flow)
+                                     #                          planes in planes/<sim>/
+                                     #   all_flowplot_planes → per-plane images of EVERY flow slice through z
+                                     #                          in planes/<sim>/ (MAIN channel only; each plane
+                                     #                          autoscales to its own dynamic range)
+                                     #   video               → z-ordered video of the MAIN-channel flow slices in
+                                     #                          planes/<sim>/ (VB channels get no flow video)
+                                     #                          (if all_flowplot_planes is absent the frames are
+                                     #                          built, encoded, then deleted — only the video is kept)
                                      #   flowplot       → flows/<sim>_flowplot_main.jpg   (main channel waterfall)
                                      #                    Auto-keeps 'overlay' whenever it is present, because
                                      #                    both figures come from the same flow slices.
@@ -346,7 +371,13 @@ simulation:                          # General simulation parameters
                                      #   transmission   → figures/<sim>_summary.jpg
                                      #   lens           → Lens_diags/<sim>_*        (CRL defect diagnostics)
                                      #   vb             → VB_figures/<sim>_*        (VB debug crops @TCC)
-  individual_fig_log: 0              # If the individual figures (of the planes defined in the yaml file, except the flow planes) must be saved on linear [0] or log scale [1].
+  individual_fig_log: 0              # Colour scale of the exported plane images in planes/<sim>/:
+                                     #   0 → linear only, 1 → log only, 2 → BOTH. In mode 2 each plane is
+                                     #   written twice (<plane>_lin.png + <plane>_log.png) and, if 'video'
+                                     #   is enabled, TWO videos are produced (…_lin + …_log).
+                                     # PRINCIPAL planes are exported for all channels (main + VB); FLOW
+                                     # planes/video are MAIN-channel only and autoscale per plane.
+  flow_video_fps: 10                 # Frame rate [fps] of the generated flow video(s).
   intensity_units: photons           # 'photons' or 'relative'. Unit of the intensity displayed. For 'photons' the code makes sure that "photons_total" photons are at the beam_shaper plane. For 'relative', the first plane intensity maximum will be set to unity.
   beamdiv: 0.0001                    # Initial beam divergence in [rad]
   name: as_filename                  # Simulation name (used for Pickles and figures). If = "as_filename" it will take the same name as the yaml input file.
@@ -379,6 +410,10 @@ simulation:                          # General simulation parameters
   - 0.25
   edge_damping_shape: circular       # Shape of the edge damping. "circular" uses a sinus function for damping.
   flow:                              # Parameters of the flow plots saved. Flow planes are saved in this example from -4.2 meter, to +4.2 meter, every 0.01 meter.
+                                     # The THIRD value is interpreted by its magnitude:
+                                     #   <= 9  → STEP between planes [m] (as here: 0.01 m spacing).
+                                     #   >  9  → total NUMBER of flow planes, evenly spaced from start to end
+                                     #           (endpoints included). e.g. [-4.2, 4.2, 100] → 100 planes.
   - -4.2
   - 4.2
   - 0.01
@@ -430,4 +465,13 @@ simulation:                          # General simulation parameters
 #   meta['SNR'][(pol, 'roi'|'roi2')]         ← SNR values
 #   meta['roi_box_m'], meta['roi2_box_m']    ← actual box dimensions
 #   meta['roi_label'], meta['roi2_label']    ← human-readable labels
+#
+# roi3 (N-shots-optimal box, computed automatically in flow_plot):
+#   meta['VB_photons'][pol]['roi3']          ← VB integrals in the optimal box
+#   meta['BG_photons']['roi3']               ← BG integral in the optimal box
+#   meta['SNR'][(pol, 'roi3')]               ← SNR in the optimal box
+#   meta['roi3_box_m']                       ← (rect_x_m, rect_y_m) optimal box
+#   meta['roi3_label']                       ← e.g. '85.2×44.5µm opt'
+#   meta['roi3_nshots']                      ← shots to 1σ (perp, purity 1e-5)
+#   meta['roi3_fwhm_m']                      ← (FWHM_x, FWHM_y) of the VB_perp signal
 # ============================================================

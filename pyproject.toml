@@ -20,6 +20,7 @@ dependencies = [
   "ipympl",
   "astropy",
   "LightPipes",
+  "pyfftw",
   "h5py",
   "Pillow",
   "scikit-image",
