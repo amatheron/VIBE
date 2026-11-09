@@ -165,8 +165,8 @@ def yamlval(key,ip,default=0):
 # ----------------------------------------------------------------------------
 # Output location
 # ----------------------------------------------------------------------------
-# Simulation outputs must NOT be written next to the source code on the (small,
-# backed-up) home filesystem. They go to the cluster "work" filesystem instead.
+# Simulation outputs go on the cluster ``/work`` BeeGFS work-filesystem. The repo's
+# git-ignored ``VIBE_outputs`` folder is a symlink to ``/work/yu79deg/VIBE_outputs``.
 # Override with the VIBE_OUTPUT_DIR environment variable if needed.
 DEFAULT_OUTPUT_ROOT = "/work/yu79deg/VIBE_outputs"
 
@@ -399,6 +399,28 @@ def build_input_params(cfg: dict, *, N: int, projectdir: str, filename: str) -> 
     IR = cfg.get("IRLaser", {})
     S  = cfg.get("simulation", {})
 
+    # Boundary default: edge damping (an absorbing sine-taper ring at the grid edge). If the yaml
+    # sets NEITHER edge_damping NOR zero_pad_frac, apply the default edge damping. Setting
+    # zero_pad_frac explicitly opts into zero-padding (linear-convolution) instead.
+    _edge_damp = yamlval("edge_damping", S, None)
+    _zero_pad  = yamlval("zero_pad_frac", S, None)
+    if _edge_damp is None and _zero_pad is None:
+        _edge_damp = [0.2]                      # default guard band: 20% edge damping per side
+    if _zero_pad is None:
+        _zero_pad = 0.0
+
+    # Probe photon energy: Xbeam.wavelength [m] (convenient for optical probes) takes
+    # precedence over Xbeam.photonenergy [eV].
+    _wl = yamlval("wavelength", X, None)
+    if _wl is not None:
+        _E_probe = h * c / (float(_wl) * e)
+    else:
+        _E_probe = float(yamlval("photonenergy", X, 8766))           # fallback 8766 eV
+
+    _precision = str(yamlval("precision", S, "complex64")).strip().lower()
+    if _precision not in ("complex64", "complex128"):
+        raise ValueError(f"simulation.precision must be 'complex64' or 'complex128', got '{_precision}'")
+
     return {
         # ---- identifiers & paths ----
         "N": int(N),
@@ -406,7 +428,8 @@ def build_input_params(cfg: dict, *, N: int, projectdir: str, filename: str) -> 
         "projectdir": projectdir,
 
         # ---- core simulation inputs (X-ray & grid) ----
-        "photon_energy": float(yamlval("photonenergy", X, 8766)),   # fallback 8766 eV
+        "photon_energy": _E_probe,
+        "precision":     _precision,
         "beamsize":      float(yamlval("size", X, 0.002)),          # fallback 2 mm
         "gauss_x_shift": float(yamlval("offset", X, 0.0)),
         "gauss_x_tilt":  float(yamlval("tilt", X, 0.0)),
@@ -437,11 +460,15 @@ def build_input_params(cfg: dict, *, N: int, projectdir: str, filename: str) -> 
         "profiles_xlim":  yamlval("profiles_xlim", S, [0, 200]),
         "intensity_ylim": yamlval("intensity_ylim", S, [1e-10, 2.0]),
         "apertures_ylim": yamlval("apertures_ylim", S, [1e-10, 2.0]),
-        "edge_damping":        yamlval("edge_damping", S, None),
+        "edge_damping":        _edge_damp,
         "edge_damping_shape":  yamlval("edge_damping_shape", S, None),
+        "zero_pad_frac":       float(_zero_pad),
+        "reg_bandlimit":       yamlval("reg_bandlimit", S, True),
         "method":              yamlval("method", S, "FFT"),
         "subfigure_size_px":   yamlval("subfigure_size_px", S, 300),
         "flow":                yamlval("flow", S, None),
+        "save_flow_lineouts":  yamlval("save_flow_lineouts", S, 0),
+        "flow_views":          yamlval("flow_views", S, None),
         "save_fig_and_pickle": yamlval("save_fig_and_pickle", S, 1),
 
         "save_individual_figures": yamlval("save_individual_figures", S, 0),
@@ -459,6 +486,7 @@ def build_input_params(cfg: dict, *, N: int, projectdir: str, filename: str) -> 
         "IR_Energy_J":       float(yamlval("IR_Energy_J", IR, 4.8)),
         "IR_FWHM_duration":  float(yamlval("IR_FWHM_duration", IR, 30e-15)),
         "IR_wavelength":     float(yamlval("IR_wavelength", IR, 800e-9)),
+        "phi_VB_deg":        float(yamlval("phi_VB_deg", IR, 45.0)),
         "IR_x_offset_m":     float(yamlval("IR_x_offset_m", IR, 0.0)),
         "IR_y_offset_m":     float(yamlval("IR_y_offset_m", IR, 0.0)),
         "Timing_jitter":     float(yamlval("Timing_jitter", IR, 0.0)),
@@ -522,6 +550,7 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
         Supported tokens (case-insensitive):
             - individual
             - flowplot        (main waterfall  — auto-keeps 'overlay' too)
+            - flowplot_side   (vertical-cutout side-view waterfalls; opt-in)
             - vb_flowplots    (VB_parr / VB_perp waterfalls; off by default because
                                the overlay already contains the same information)
             - overlay         (main + VB overlay waterfall)
@@ -546,6 +575,7 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
 
     keep_individual    = ("individual" in keep)
     keep_flowplot      = ("flowplot" in keep)
+    keep_flowplot_side = ("flowplot_side" in keep)  # NEW: vertical-cutout side view
     keep_vb_flowplots  = ("vb_flowplots" in keep)   # NEW: VB channel waterfalls
     keep_overlay       = ("overlay" in keep)
     keep_mosaic        = ("mosaic" in keep)
@@ -585,6 +615,12 @@ def cleanup_heavy_outputs(projectdir: Path, filename: str, *, save_pickle: int =
     if not keep_flowplot:
         patterns += [
             str(flow_dir / f"{filename}_flowplot_main*"),
+        ]
+
+    # 'flowplot_side' bucket: vertical-cutout (side view) waterfalls
+    if not keep_flowplot_side:
+        patterns += [
+            str(flow_dir / f"{filename}_flowplot_side_*"),
         ]
 
     # 'vb_flowplots' bucket: the VB_parr / VB_perp waterfalls (opt-in;
@@ -685,12 +721,45 @@ class FieldBundle:
 
 
 
+def Forvard_padded(dz: float, F, pad_frac: float):
+    """
+    Forvard (FFT) propagation on a ZERO-PADDED grid -> linear (non-circular) convolution.
+
+    Forvard is periodic (FFT), so a field that is not ~0 at the grid edge WRAPS AROUND; the usual
+    cure is the absorbing edge-damping ring, which wastes a big guard band (25% each side -> only
+    half the box is usable). Padding the field with zeros by `pad_frac` before the transform turns
+    the circular convolution into a linear one: whatever would wrap lands in the (discarded) padding,
+    so the WHOLE central box stays valid and no absorbing ring is needed. Cost: a transient
+    (1+pad_frac)^2-larger FFT for one field. pad_frac<=0 reproduces plain Forvard exactly.
+    """
+    if pad_frac <= 0.0:
+        return Forvard(dz, F)
+    N    = F.N
+    dx   = F.siz / F.N
+    ext  = int(round(pad_frac * N))
+    pb   = ext // 2
+    Npad = N + ext
+    Fp = Begin(Npad * dx, F.lam, Npad, dtype=F._dtype)
+    buf = np.zeros((Npad, Npad), dtype=F.field.dtype)
+    buf[pb:pb + N, pb:pb + N] = F.field
+    Fp.field = buf
+    Fp._IsGauss = False
+    Fp = Forvard(dz, Fp)
+    F.field = np.ascontiguousarray(Fp.field[pb:pb + N, pb:pb + N])
+    return F
+
+
 def propagate_bundle(bundle: 'FieldBundle',
                      dz: float,
-                     method: str = 'FFT') -> 'FieldBundle':
+                     method: str = 'FFT',
+                     pad_frac: float = 0.0) -> 'FieldBundle':
     """
     Move *all* fields contained in *bundle* forward by *dz* using the same
     rules that `main_VIBE` loop currently applies to `F`.
+
+    pad_frac>0 runs the FFT ('FFT'/Forvard) method on a zero-padded grid so the box edge does not
+    wrap around (linear convolution), letting the whole box be usable without a big edge-damping
+    ring. pad_frac=0 keeps the exact previous behaviour.
     """
     if dz == 0:
         return bundle  # nothing to do
@@ -700,7 +769,7 @@ def propagate_bundle(bundle: 'FieldBundle',
             if method.lower() == 'fresnel':
                 F = Fresnel(dz, F)
             elif method.upper() == 'FFT':
-                F = Forvard(dz, F)
+                F = Forvard_padded(dz, F, pad_frac)
             else:
                 raise ValueError(f"Unknown propagation method: {method}")
         else:
@@ -767,6 +836,13 @@ def get_index(elem, E, table_dir=None):
     header lines followed by ``Energy(eV), Delta, Beta`` columns.
     """
     global _index_cache
+
+    if E < 30.0:
+        raise ValueError(
+            f"[get_index] photon energy E={E:.3g} eV (λ={h*c/(E*e)*1e9:.0f} nm) is an optical/UV probe: "
+            f"Henke X-ray optical constants for '{elem}' are not valid here. Use ideal elements instead "
+            f"(apertures with shape circle/gaussian/square/... and NO 'elem' key, ideal 'lens'/'lens_reg' "
+            f"with size: 0, celestre: 0, seiboth: 0).")
 
     # Locate optical_constants folder relative to the file location of VIBE.py
     if table_dir is None:
@@ -1226,10 +1302,7 @@ def do_edge_damping_aperture(params):
                 mu.figure()
                 plt.imshow(r)
                 plt.colorbar()
-            for xi,x in enumerate(xm):
-                for yi,y in enumerate(xm):
-                    val=np.interp(r[xi,yi],rax,prof2)
-                    trans[xi,yi]=val
+            trans = np.interp(r, rax, prof2)   # vectorised (identical to the former per-pixel loop)
 
     else: #doing silly pixel damping
         for ri,mult in enumerate(edge_damping_pixels):
@@ -1287,7 +1360,14 @@ def get_aperture_transmission_map(pars, params={}, debug=0):
     elif typ == 'circle':
         r = np.sqrt(xm**2 + ym**2)
         rad = pars['size'] / 2
-        trmap[r < rad] = 0
+        ew = float(pars.get('edge_width', 0.0) or 0.0)   # optional raised-cosine edge [m] (ideal circle only)
+        if ew > 0:
+            r_in, r_out = rad - ew / 2, rad + ew / 2
+            trmap[r <= r_in] = 0
+            band = (r > r_in) & (r < r_out)
+            trmap[band] = 0.5 * (1.0 - np.cos(np.pi * (r[band] - r_in) / ew))
+        else:
+            trmap[r < rad] = 0
 
     elif typ == 'gaussian':
         r2 = xm**2 + ym**2
@@ -1849,7 +1929,8 @@ def doap(pars,params=[],debug=0,return_thickness=0):
     N2 = int(N/2)
     typ = pars['shape']
 
-    if typ in ['square','rectangle','wire','gaussian','doublegaussian']:
+    if typ in ['square','rectangle','wire','gaussian','doublegaussian'] or (typ == 'circle' and not pars.get('elem')):
+        # purely geometric (ideal, non-material) masks; 'circle' only when no 'elem' is given
         transmissionmap = get_aperture_transmission_map(pars,params,debug)
         phaseshiftmap = transmissionmap * 0
         thicknessmap = transmissionmap * 0
@@ -2012,6 +2093,66 @@ def doap(pars,params=[],debug=0,return_thickness=0):
         return transmissionmap,phaseshiftmap
 
 
+def build_grating_maps(el_dict, params):
+    """Transmission + phase maps for a bar/space (Ronchi) grating inside a
+    circular aperture.
+
+    The grating is a 50%-duty-cycle set of parallel `material` bars of the
+    given `thickness`; the bars impart both absorption AND phase (via the
+    material refractive index at the simulation photon energy), like the
+    other physical objects (realwire, wireslit, ...). Everything outside the
+    circular `aperture` (a DIAMETER, in metres) is blocked.
+
+    YAML keys (under a `type: Grating` element):
+        lines_per_mm             line density [1/mm] -> period = 1/lines_per_mm
+        aperture                 circular aperture DIAMETER [m]
+        orientation_along_lines  'v' -> vertical lines   (periodic along x)
+                                 'h' -> horizontal lines (periodic along y)
+        material                 element symbol for get_index (e.g. 'W')
+        thickness                bar thickness [m]
+    """
+    N      = params['N']
+    pxsize = params['pxsize']
+    E      = params['photon_energy']
+
+    lines_per_mm = float(el_dict['lines_per_mm'])
+    thickness    = float(el_dict['thickness'])
+    material     = el_dict.get('material', el_dict.get('elem', 'W'))
+    aperture     = float(el_dict.get('aperture', 0.0))
+    orient       = str(el_dict.get('orientation_along_lines', 'v')).lower()
+
+    if lines_per_mm <= 0:
+        raise ValueError(f"[Grating] lines_per_mm must be > 0 (got {lines_per_mm}).")
+    period = 1e-3 / lines_per_mm            # metres (lines_per_mm lines per mm)
+
+    if period < 2.0 * pxsize:
+        print(f"[Grating] WARNING: period {period*1e9:.1f} nm < 2 px "
+              f"({pxsize*1e9:.1f} nm/px) -> grating is unresolved; increase Resolution.")
+
+    N2 = N // 2
+    Na = (np.arange(N) - N2) * pxsize
+    xm, ym = np.meshgrid(Na, Na)
+
+    # periodicity axis: vertical lines -> modulate along x; horizontal -> along y
+    coord = xm if orient.startswith('v') else ym
+    bars  = np.mod(coord, period) < 0.5 * period      # 50% duty cycle
+
+    thicknessmap = np.zeros((N, N))
+    thicknessmap[bars] = thickness
+
+    # thickness -> transmission (absorption) + phase, via the material index
+    beta, delta = get_index(material, E)
+    thickness_to_phaseshift, k = thickness_to_phase_and_transmission(E, delta, beta)
+    transmissionmap = np.exp(-k * thicknessmap)
+    phaseshiftmap   = thicknessmap * thickness_to_phaseshift
+
+    # circular aperture: block everything outside the diameter
+    if aperture > 0:
+        outside = (xm**2 + ym**2) > (0.5 * aperture) ** 2
+        transmissionmap[outside] = 0.0
+        phaseshiftmap[outside]   = 0.0
+
+    return transmissionmap, phaseshiftmap
 
 
 def build_gazjet_maps(el_dict, params, F=None):
@@ -2176,6 +2317,7 @@ def prepare_image(
     norms=None,
     el_dict=None,
     normalize=True,
+    average=True,
 ):
     """
     Prepare a 2D image for visualization or export.
@@ -2204,6 +2346,9 @@ def prepare_image(
         Unused placeholder for backward compatibility.
     normalize : bool, optional
         If True, normalize integrated quantities using `norms`.
+    average : bool, optional
+        Downsample by area-averaging (conserves integrated intensity; default). False -> cubic
+        interpolation (used for phase maps, which must not be averaged across wraps).
 
     Returns
     -------
@@ -2251,10 +2396,12 @@ def prepare_image(
     # Downsample if image is too large
     # --------------------------------------------------
     if img_out.shape[0] > max_pixels:
+        # INTER_AREA averages the input pixels -> conserves the integrated intensity (photon counts) even for
+        # features narrower than an output pixel (a focus); INTER_CUBIC point-samples them. Phase maps keep cubic.
         img_out = cv2.resize(
             img_out,
             dsize=(max_pixels, max_pixels),
-            interpolation=cv2.INTER_CUBIC,
+            interpolation=cv2.INTER_AREA if average else cv2.INTER_CUBIC,
         )
 
     return img_out, norms, [integrated_max, integrated_sum]
@@ -2808,9 +2955,201 @@ def roi_label(rect_x_m, rect_y_m, mode):
     return f"{x_um:.1f}×{y_um:.1f} µm ({mode})"
 
 
+_ANALYSER_DEFAULTS = {"Confidence_level_Z": 1.645,
+                      "Analyser_transm_seeded_signal": 0.5,
+                      "Analyser_pola_purity": 1e-5}
+
+
+def _short_num(v):
+    """Compact number for table labels: 1.645, 0.5, 1e-4, 2.5e-7."""
+    v = float(v)
+    if v != 0 and (abs(v) < 1e-2 or abs(v) >= 1e4):
+        e = int(np.floor(np.log10(abs(v))))
+        m = float(f"{v / 10.0**e:.3g}")
+        if abs(m) >= 10:
+            m /= 10.0
+            e += 1
+        return f"{m:g}e{e}"
+    return f"{v:.4g}"
+
+
+def parse_analyser_sets(det_dict):
+    """Analyser parameter sets for the perp-channel N-shots, read from the Det yaml block.
+
+    Set 1 uses the un-suffixed keys (Confidence_level_Z, Analyser_transm_seeded_signal,
+    Analyser_pola_purity); set k>=2 exists when any of those keys with suffix k is given.
+    Missing keys fall back to _ANALYSER_DEFAULTS. Returns [{Z, T, P, label}], label = "N(Z,T,P)".
+    """
+    det_dict = det_dict if isinstance(det_dict, dict) else {}
+    idx = {1}
+    for key in det_dict:
+        m = re.fullmatch(r"(Confidence_level_Z|Analyser_transm_seeded_signal|Analyser_pola_purity)(\d+)", str(key))
+        if m and int(m.group(2)) >= 2:
+            idx.add(int(m.group(2)))
+    sets = []
+    for k in sorted(idx):
+        suf = "" if k == 1 else str(k)
+        vals = {}
+        for name, default in _ANALYSER_DEFAULTS.items():
+            raw = det_dict.get(name + suf, default)
+            try:
+                vals[name] = float(raw)          # yaml '1e-4' (no dot) loads as a str
+            except (TypeError, ValueError):
+                print(f"[N-shots] invalid Det.{name + suf}={raw!r} -> default {default:g}")
+                vals[name] = default
+        Z = vals["Confidence_level_Z"]
+        T = vals["Analyser_transm_seeded_signal"]
+        P = vals["Analyser_pola_purity"]
+        sets.append({"Z": Z, "T": T, "P": P,
+                     "label": f"N({_short_num(Z)},{_short_num(T)},{_short_num(P)})"})
+    return sets
+
+
+def nshots_perp(S, BG_raw, Z, T, P, relax_ratio=0.1):
+    """Shots to a Z-sigma VB_perp detection: N = Z²(T·S + (1+r)·P·B)/(T·S)².
+    S = VB_perp, B = background (both as reported); T = analyser transmission of the
+    seeded signal, P = analyser polarisation purity, r = n_relax/n_nolax."""
+    if not (np.isfinite(S) and S > 0 and T > 0):
+        return np.nan
+    Seff = T * S
+    Beff = P * BG_raw if np.isfinite(BG_raw) else 0.0
+    return Z * Z * (Seff + (1.0 + relax_ratio) * Beff) / Seff**2
+
+
+# ---- Heisenberg-Euler a, b measured from BOTH VB channels -----------------------------
+#   S_par = K (c+ - c- cos2φ)²,  S_perp = K c-² sin²2φ,  c± = b ± a  (a = 4, b = 7 -> c+ = 11, c- = 3)
+#   K (pump intensity², probe photons, overlap) is common to both channels and cancels in ratios;
+#   its calibration error Var(K)/K² is the systematic floor of a and b.
+_HE_A, _HE_B = 4.0, 7.0
+_AB_ERROR_DEFAULTS = {"pump_intensity_error": 0.1,   # relative error on the pump intensity (0.1 = 10 %)
+                      "probe_photons_error": 0.1,    # relative error on the probe photon number
+                      "timing_error": 10.0,          # pump-probe timing offset [fs]
+                      "spatial_error": 0.2,          # pump-probe spatial offset [µm]
+                      "polarisation_error": 2.0}     # pump-probe polarisation angle error [deg]
+
+
+def parse_ab_errors(det_dict):
+    """Systematic-error inputs of the a, b measurement, read from the Det yaml block (defaults otherwise)."""
+    det_dict = det_dict if isinstance(det_dict, dict) else {}
+    out = {}
+    for name, default in _AB_ERROR_DEFAULTS.items():
+        raw = det_dict.get(name, default)
+        try:
+            out[name] = float(raw)
+        except (TypeError, ValueError):
+            print(f"[a,b] invalid Det.{name}={raw!r} -> default {default:g}")
+            out[name] = default
+    return out
+
+
+def ab_systematics(errors, pump_fwhm_s, probe_fwhm_s, pump_focus_fwhm_m, probe_focus_fwhm_m,
+                   lam_ir=800e-9, phi_deg=45.0):
+    """Relative signal error ε of each systematic source and the total Var(K)/K².
+
+    σ = FWHM/2.355 is the RMS width of an intensity profile (time or space).
+    Common to both channels (they enter K):
+        ε_I = 2·δI/I                                          (signal ∝ I_pump²)
+        ε_P = δN/N                                            (signal ∝ N_probe)
+        ε_t = 1 - exp(-t0²/2τ_t²),  τ_t² = σ_pr² + σ_pu²/2 + (z_R/c)²   (pulse durations, pump Rayleigh range)
+        ε_Δ = 1 - exp(-Δ²/2Σ²),     Σ²  = σ_pr² + σ_pu²/2               (focal spots, worst of x and y)
+        Var(K)/K² = ε_I² + ε_P² + ε_t² + ε_Δ²
+    Channel-specific (polarisation angle φ0 ± δφ): ε_φ∥, ε_φ⊥ = largest |S(φ0±δφ)/S(φ0) - 1|.
+    `probe_focus_fwhm_m` is a scalar or (FWHM_x, FWHM_y).
+    """
+    to_rms = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    c_light = 299792458.0
+    eps_I = 2.0 * errors["pump_intensity_error"]
+    eps_P = errors["probe_photons_error"]
+
+    w0 = pump_focus_fwhm_m / np.sqrt(2.0 * np.log(2.0))           # 1/e² intensity radius of the pump
+    zR = np.pi * w0**2 / lam_ir
+    tau_t = np.sqrt((probe_fwhm_s * to_rms)**2 + (pump_fwhm_s * to_rms)**2 / 2.0 + (zR / c_light)**2)
+    t0 = errors["timing_error"] * 1e-15
+    eps_t = 1.0 - np.exp(-t0**2 / (2.0 * tau_t**2))
+
+    pfx, pfy = (probe_focus_fwhm_m if np.ndim(probe_focus_fwhm_m) else (probe_focus_fwhm_m,) * 2)
+    s_pu = pump_focus_fwhm_m * to_rms
+    Sig_x = np.sqrt((pfx * to_rms)**2 + s_pu**2 / 2.0)
+    Sig_y = np.sqrt((pfy * to_rms)**2 + s_pu**2 / 2.0)
+    D = errors["spatial_error"] * 1e-6
+    eps_Dx = 1.0 - np.exp(-D**2 / (2.0 * Sig_x**2))
+    eps_Dy = 1.0 - np.exp(-D**2 / (2.0 * Sig_y**2))
+    eps_D = max(eps_Dx, eps_Dy)
+
+    c_p, c_m = _HE_B + _HE_A, _HE_B - _HE_A
+    phi0, dphi = np.deg2rad(phi_deg), np.deg2rad(errors["polarisation_error"])
+    S_par  = lambda p: (c_p - c_m * np.cos(2 * p))**2
+    S_perp = lambda p: (c_m * np.sin(2 * p))**2
+    eps_phi_par = max(abs(S_par(phi0 + s * dphi) / S_par(phi0) - 1.0) for s in (1, -1))
+    eps_phi_perp = (max(abs(S_perp(phi0 + s * dphi) / S_perp(phi0) - 1.0) for s in (1, -1))
+                    if S_perp(phi0) > 0 else np.nan)
+
+    return {"errors": dict(errors), "phi_deg": float(phi_deg), "lam_ir": float(lam_ir),
+            "pump_fwhm_s": float(pump_fwhm_s), "probe_fwhm_s": float(probe_fwhm_s),
+            "pump_focus_fwhm_m": float(pump_focus_fwhm_m),
+            "probe_focus_fwhm_m": (float(pfx), float(pfy)),
+            "zR_m": float(zR), "tau_t_s": float(tau_t), "Sigma_m": (float(Sig_x), float(Sig_y)),
+            "eps_I": float(eps_I), "eps_P": float(eps_P), "eps_t": float(eps_t),
+            "eps_D": float(eps_D), "eps_Dx": float(eps_Dx), "eps_Dy": float(eps_Dy),
+            "eps_phi_par": float(eps_phi_par), "eps_phi_perp": float(eps_phi_perp),
+            "VarK_rel": float(eps_I**2 + eps_P**2 + eps_t**2 + eps_D**2)}
+
+
+def _ab_coeffs(sysd):
+    """u, v (S_par = K u², S_perp = K v²), the ⊥ weights g_a, g_b and the systematic variances C_a, C_b.
+
+    a = (u - g_a v)/2, b = (u + g_b v)/2 with g_a = (1-cos2φ)/|sin2φ|, g_b = (1+cos2φ)/|sin2φ|.
+    C_v = v²·Var(K)/(4K²) + (u² ε_φ∥² + g² v² ε_φ⊥²)/16.  Returns None when sin2φ = 0 (no ⊥ signal).
+    """
+    c_p, c_m = _HE_B + _HE_A, _HE_B - _HE_A
+    phi = np.deg2rad(sysd["phi_deg"])
+    c2, s2 = np.cos(2 * phi), abs(np.sin(2 * phi))
+    if s2 < 1e-9:
+        return None
+    u, v = c_p - c_m * c2, c_m * s2
+    g_a, g_b = (1 - c2) / s2, (1 + c2) / s2
+    vk, ep, es = sysd["VarK_rel"], sysd["eps_phi_par"], sysd["eps_phi_perp"]
+    C_a = _HE_A**2 * vk / 4 + (u**2 * ep**2 + (g_a * v)**2 * es**2) / 16
+    C_b = _HE_B**2 * vk / 4 + (u**2 * ep**2 + (g_b * v)**2 * es**2) / 16
+    return u, v, g_a, g_b, C_a, C_b
+
+
+def ab_zmax(sysd):
+    """Highest significance reachable on a and b with infinite statistics: (a/√C_a, b/√C_b)."""
+    co = _ab_coeffs(sysd)
+    if co is None:
+        return np.nan, np.nan
+    return _HE_A / np.sqrt(co[4]), _HE_B / np.sqrt(co[5])
+
+
+def nshots_ab(S_par, S_perp, BG_raw, Z, T, P, sysd, relax_ratio=0.1):
+    """Shots to measure a and b to Z sigma from both VB channels -> (N_a, N_b).
+
+    Per channel: X = (S_eff + (1+r)·B_eff)/S_eff² with S_eff = T·S; the parallel analyser transmits
+    the probe background (B_eff = T·BG), the crossed one rejects it (B_eff = P·BG).
+        N_v = Z² A_v / (v² - Z² C_v),   A_v = (u² X∥ + g_v² v² X⊥)/16
+    N = inf when Z exceeds the systematic floor Z_max = v/√C_v.
+    """
+    co = _ab_coeffs(sysd)
+    if (co is None or T <= 0 or not (np.isfinite(S_par) and np.isfinite(S_perp))
+            or S_par <= 0 or S_perp <= 0):
+        return np.nan, np.nan
+    u, v, g_a, g_b, C_a, C_b = co
+    B = BG_raw if (np.isfinite(BG_raw) and BG_raw > 0) else 0.0
+    Sp, Ss = T * S_par, T * S_perp
+    X_par  = (Sp + (1.0 + relax_ratio) * T * B) / Sp**2
+    X_perp = (Ss + (1.0 + relax_ratio) * P * B) / Ss**2
+    out = []
+    for val, g, C in ((_HE_A, g_a, C_a), (_HE_B, g_b, C_b)):
+        A = (u**2 * X_par + (g * v)**2 * X_perp) / 16.0
+        den = val**2 - Z * Z * C
+        out.append(Z * Z * A / den if den > 0 else np.inf)
+    return out[0], out[1]
+
+
 def optimize_roi3_nshots(signal_img, bg_img, dx_m, *,
-                         pol_purity=1e-5, z=1.0, fano=1.0,
-                         n_scan=30, frac_lo=0.2, frac_hi=3.0):
+                         pol_purity=1e-5, z=1.0, fano=1.0, relax_nolax_ratio=0.1,
+                         sig_factor=1.0, n_scan=30, frac_lo=0.2, frac_hi=3.0):
     """Centred rectangular Det ROI that MINIMISES the shots-to-`z`σ VB_perp
     detection (perp channel: background suppressed by `pol_purity`).
 
@@ -2819,9 +3158,12 @@ def optimize_roi3_nshots(signal_img, bg_img, dx_m, *,
     from `frac_lo × FWHM` to `frac_hi × FWHM` (FWHM taken from `signal_img`).
     For each candidate box:
 
-        S      = ∫ signal     over the box            (VB_perp photons)
+        S      = sig_factor × ∫ signal over the box   (VB_perp photons × analyser transmission)
         B_eff  = pol_purity × ∫ background over the box
-        N_shot = z² (S + 2·fano·B_eff) / S²           (1σ shots, equal ON/OFF)
+        N_shot = z² (S + (1+r)·fano·B_eff) / S²       (r = n_relax/n_nolax)
+
+    `relax_nolax_ratio` (r) is the ratio of relax to no-lax shots; r = 1
+    recovers the equal ON/OFF `(S + 2·B_eff)` form.
 
     `signal_img` / `bg_img` should already be in the desired photon units so
     the returned `nshots` is a real shot count (the argmin box is unchanged by
@@ -2849,8 +3191,9 @@ def optimize_roi3_nshots(signal_img, bg_img, dx_m, *,
             BG_raw = integrate_rect(bg, dx_m, rx, ry) if bg is not None else 0.0
             if not np.isfinite(BG_raw):
                 BG_raw = 0.0
+            S_eff  = float(sig_factor) * S
             B_eff  = float(pol_purity) * BG_raw
-            nshots = z2 * (S + 2.0 * float(fano) * B_eff) / (S * S)
+            nshots = z2 * (S_eff + (1.0 + float(relax_nolax_ratio)) * float(fano) * B_eff) / (S_eff * S_eff)
             if best is None or nshots < best[0]:
                 best = (nshots, float(rx), float(ry), float(S), float(BG_raw))
 
@@ -2867,7 +3210,8 @@ def optimize_roi3_nshots(signal_img, bg_img, dx_m, *,
     }
 
 
-def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertical_type='center', log=1, xl=None, flow_figs=0, flow_plot_crange=1e-5, channel="main", include_flow=True, unit=None):
+def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertical_type='center', log=1, xl=None, flow_figs=0, flow_plot_crange=1e-5, channel="main", include_flow=True, unit=None, view_tag="", save_summary=True,
+              y_mode="um", resample="interp", show_table=True, pic=None, res=None, clim_decades=None):
     """
     Visualizes 2D flow maps along z, with optional export for movie making.
 
@@ -2885,6 +3229,16 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     channel     : str         – Channel to plot ("main", "VB_parr", ...).
     include_flow : bool       – Whether to include "flow" auto-slices.
     unit        : str or None – Intensity unit ("relative", "photons", "Wcm2").
+    y_mode      : str         – "um": vertical axis in µm (gyax_def in µm, default);
+                                "normalized": vertical axis in units of the LOCAL box half-size
+                                (gyax_def e.g. [-1, 1, 0.002]) -> one plot spans boxes that change by
+                                orders of magnitude (regularised propagation through a focus).
+    resample    : str         – "interp": point-interpolate each lineout onto gyax (default);
+                                "bin": average the lineout over each gyax bin when the plane pixels are
+                                finer than the plot step (no lost/aliased narrow peaks).
+    show_table  : bool        – draw the Det metrics table on the plot (default True).
+    pic, res    : optional already-loaded figs / res pickles (avoid re-reading them for every call).
+    clim_decades: if set, colour range = [peak/10**clim_decades, peak] of the plotted window (overrides cl).
 
     Returns
     -------
@@ -2905,8 +3259,10 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     pic_path = Path(project_dir) / 'pickles' / f'{fn_figs}.pickle'
     res_path = Path(project_dir) / 'pickles' / f'{fn_res}.pickle'
 
-    pic = mu.loadPickle(str(pic_path), strict=1)
-    res = mu.loadPickle(str(res_path))
+    if pic is None:
+        pic = mu.loadPickle(str(pic_path), strict=1)
+    if res is None:
+        res = mu.loadPickle(str(res_path))
     partial = (res == 0)
     
     # ─── Safety checks ───────────────────────────────────────────────
@@ -3035,6 +3391,8 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
         # Compute horizontal axis in μm
         xax = (np.arange(imsize) - 0.5 * imsize) * pxsize  # μm
+        if y_mode == "normalized":
+            xax = xax / (propsize * 1e6 / 2.0)              # units of the local box half-size
 
         # Compute vertical lineout based on `vertical_type`
         if vertical_type == 'center':
@@ -3048,6 +3406,12 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             lineout = picc[:, half_px]
         elif vertical_type == 'vert-integral':
             lineout = np.mean(picc, axis=1)
+        elif vertical_type == 'center-vert':
+            # side view: thin vertical band at the horizontal centre (mirror of 'center')
+            w = 2
+            start = max(0, half_px - w)
+            end   = min(imsize, half_px + w + 1)
+            lineout = np.mean(picc[:, start:end], axis=1)
         else:
             raise ValueError(f"Unknown vertical_type: {vertical_type}")
 
@@ -3059,8 +3423,19 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
         # Interpolate onto fixed gyax grid
         interp_line = np.full(len(gyax), np.nan, dtype=np.float64)
-        valid = (gyax >= np.min(xax)) & (gyax <= np.max(xax))
-        interp_line[valid] = np.interp(gyax[valid], xax, lineout)
+        _gstep = float(gyax[1] - gyax[0]) if len(gyax) > 1 else 0.0
+        _dpx   = float(xax[1] - xax[0])
+        if resample == "bin" and 0.0 < _dpx < _gstep:
+            # bin-average: exact integral of the piecewise-constant lineout over each gyax bin
+            xedges = np.concatenate(([xax[0] - _dpx / 2], xax + _dpx / 2))
+            cum    = np.concatenate(([0.0], np.cumsum(lineout, dtype=np.float64) * _dpx))
+            gedges = np.concatenate((gyax - _gstep / 2, [gyax[-1] + _gstep / 2]))
+            interp_line = np.diff(np.interp(gedges, xedges, cum)) / _gstep
+            outside = (gyax - _gstep / 2 < xedges[0]) | (gyax + _gstep / 2 > xedges[-1])
+            interp_line[outside] = np.nan
+        else:
+            valid = (gyax >= np.min(xax)) & (gyax <= np.max(xax))
+            interp_line[valid] = np.interp(gyax[valid], xax, lineout)
         fixedfall[fi, :] = interp_line * scale
 
 
@@ -3125,7 +3500,10 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         # Detect that and rescale to ~11 decades below the observed peak so
         # the plot always shows structure regardless of scale_phot.
         _data_pos = fixedfall[np.isfinite(fixedfall) & (fixedfall > 0)]
-        if _data_pos.size:
+        if _data_pos.size and clim_decades is not None:
+            _dmax = float(np.nanmax(_data_pos))
+            cl = [_dmax / 10.0 ** float(clim_decades), _dmax]
+        elif _data_pos.size:
             _dmax  = float(np.nanmax(_data_pos))
             _drange = 1e11        # ~11 decades of dynamic range
             _needs_rescale = (cl[0] > _dmax) or (cl[1] < _dmax / _drange) or (cl[1] > _dmax * 1e4)
@@ -3148,7 +3526,7 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
         # Add colorbar with label
         cb = plt.colorbar()
-        if vertical_type in ("average_horiz", "center"):
+        if vertical_type in ("average_horiz", "center", "center-vert"):
             cb_label = {
                 "photons": "photons / m²",
                 "Wcm2": "W / m²",
@@ -3208,15 +3586,19 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             _rv = float(det_dict.get("roi", 13))
             roi_um = _rv if _rv > 1.0 else 13.0       # fallback 13 µm if fraction w/o info
 
-        if det_pos is not None:
+        if det_pos is not None and y_mode != "normalized":
             plt.plot([det_pos, det_pos], [-roi_um/2, roi_um/2], 'w-', lw=5)
 
         # Axes labels and limits
+        _vert_cut = vertical_type in ("vert-center", "vert-integral", "center-vert")
         plt.xlabel('Position [m]')
-        plt.ylabel('Horizontal position [μm]')
+        if y_mode == "normalized":
+            plt.ylabel(('Vertical' if _vert_cut else 'Horizontal') + ' position / (local box/2)')
+        else:
+            plt.ylabel('Vertical position [μm]' if _vert_cut else 'Horizontal position [μm]')
         plt.xlim(xl if xl else [np.min(zax), np.max(zax)])
         plt.ylim(np.min(gyax), np.max(gyax))  # ← enforce correct y-range
-        plt.title(f"{file} cut: {vertical_type}")
+        plt.title(f"{file} cut: {vertical_type}" + (f"  [{view_tag}]" if view_tag else ""))
 
         plt.tight_layout()
 
@@ -3294,6 +3676,12 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     #   2. Otherwise, fall back to the legacy fixed 13 µm / 75 µm boxes.
     _det_yaml_dict = res[0].get("Det", {}) if isinstance(res, (list, tuple)) and len(res) > 0 else {}
     intens_all     = params.get("intensities", {}) if isinstance(params, dict) else {}
+    # n_relax/n_nolax ratio in the N-shots background term (Det yaml; default 0.1)
+    try:
+        _relax_ratio = float(_det_yaml_dict.get("nshots_relax_nolax_ratio", 0.1))
+    except (TypeError, ValueError):
+        _relax_ratio = 0.1
+    _analyser_sets = parse_analyser_sets(_det_yaml_dict)   # set 1 also drives the roi3 optimum
 
     def _get_box(tag):
         """Return (rect_x_m, rect_y_m, label)."""
@@ -3310,9 +3698,9 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     roi_specs  = [("roi",  box_roi_x,  box_roi_y,  label_roi),
                   ("roi2", box_roi2_x, box_roi2_y, label_roi2)]
 
-    # ─── ROI3: N-shots-optimal Det ROI (perp channel, purity 1e-5, 1σ) ────
+    # ─── ROI3: N-shots-optimal Det ROI (perp channel, analyser set 1) ────
     # Scan the box width/height (30×30, 0.2–3× the VB_perp FWHM) and keep the
-    # box that MINIMISES the shots-to-1σ. Computed from the Det 2-D maps in
+    # box that MINIMISES N-shots for analyser set 1. Computed from the Det 2-D maps in
     # the pickle, so a plain re-plot picks it up (no re-sim of the field).
     # Adds a third table column + summary fields (roi3_*).
     roi3_info  = None
@@ -3328,14 +3716,17 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                 _s_sc, _b_sc = _s_img * scale_Wcm, _b_img * scale_Wcm
             else:
                 _s_sc, _b_sc = _s_img, _b_img
+            _a1 = _analyser_sets[0]
             roi3_info = optimize_roi3_nshots(_s_sc, _b_sc, _dx3,
-                                             pol_purity=1e-5, z=1.0, fano=1.0)
+                                             pol_purity=_a1["P"], z=_a1["Z"], fano=1.0,
+                                             sig_factor=_a1["T"],
+                                             relax_nolax_ratio=_relax_ratio)
             if roi3_info is not None:
                 _r3x, _r3y = roi3_info["box_m"]
                 label_roi3 = roi3_info["label"]
                 roi_specs.append(("roi3", _r3x, _r3y, label_roi3))
                 print(f"[ROI3] optimum box = {label_roi3}  "
-                      f"N-shots(1σ, perp 1e-5) = {roi3_info['nshots']:.3e}")
+                      f"{_a1['label']} = {roi3_info['nshots']:.3e}")
     except Exception:
         import traceback
         print("[ROI3] CRASH during optimum-ROI computation!")
@@ -3417,15 +3808,93 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                 if np.isfinite(vb_val) and np.isfinite(bg_val) and bg_val != 0:
                     SNR[(pol, tag)] = vb_val / bg_val
 
+    # ─── N-shots per analyser set (perp channel, S = VB⊥ and B = BG as in the table) ───
+    nshots_sets = []
+    for _s in _analyser_sets:
+        _vals = {tag: nshots_perp(VB_photons.get("VB_perp", {}).get(tag, np.nan),
+                                  BG_photons.get(tag, np.nan),
+                                  _s["Z"], _s["T"], _s["P"], _relax_ratio)
+                 for tag, *_ in roi_specs}
+        nshots_sets.append({**_s, "relax_ratio": _relax_ratio, "nshots": _vals})
+
+    # ─── N_a / N_b: shots to measure the Heisenberg-Euler a, b to Z sigma (both channels) ───
+    nab_sets, ab_sys = [], None
+    if VB_photons.get("VB_parr") and VB_photons.get("VB_perp"):
+        try:
+            _pump_foc = params.get("IR_FWHM_diam_used")
+            if _pump_foc is None:          # older runs: read it back from the saved IR focus map
+                try:
+                    _pump_foc = float(np.load(Path(project_dir) / "pickles" / f"{file}_IRlaser_focus_map.npz")["fwhm_diam_used"])
+                except Exception:
+                    _pump_foc = float(params.get("IR_FWHM_gaussian", 1.3e-6))
+            _probe_foc = params.get("probe_TCC_fwhm_m")
+            if _probe_foc is None and "TCC_main" in pic:
+                _ti, _, _tp, _ = pic["TCC_main"]
+                _probe_foc = fwhm_xy_of_image(_ti, float(_tp) / np.shape(_ti)[0])
+            if _probe_foc is None or not np.all(np.isfinite(_probe_foc)):
+                print("[a,b] probe focus size at TCC unknown -> using the pump focus FWHM for the spatial term")
+                _probe_foc = (_pump_foc, _pump_foc)
+            ab_sys = ab_systematics(parse_ab_errors(_det_yaml_dict),
+                                    pump_fwhm_s=float(params.get("IR_FWHM_duration", 30e-15)),
+                                    probe_fwhm_s=float(params.get("X_FWHM_duration", 25e-15)),
+                                    pump_focus_fwhm_m=float(_pump_foc),
+                                    probe_focus_fwhm_m=tuple(float(v) for v in _probe_foc),
+                                    lam_ir=float(params.get("IR_wavelength", 800e-9)),
+                                    phi_deg=float(params.get("phi_VB_deg", 45.0)))
+            for _s in _analyser_sets:
+                _na, _nb = {}, {}
+                for tag, *_ in roi_specs:
+                    _na[tag], _nb[tag] = nshots_ab(VB_photons["VB_parr"].get(tag, np.nan),
+                                                   VB_photons["VB_perp"].get(tag, np.nan),
+                                                   BG_photons.get(tag, np.nan),
+                                                   _s["Z"], _s["T"], _s["P"], ab_sys, _relax_ratio)
+                nab_sets.append({**_s, "relax_ratio": _relax_ratio,
+                                 "label_a": "N_a" + _s["label"][1:], "label_b": "N_b" + _s["label"][1:],
+                                 "N_a": _na, "N_b": _nb})
+
+            if channel == "main":
+                _e, _sy = ab_sys["errors"], ab_sys
+                _v2 = (_HE_B - _HE_A)**2 * np.sin(2 * np.deg2rad(_sy["phi_deg"]))**2   # S_perp = K c-² sin²2φ
+                _za, _zb = ab_zmax(_sy)
+                print("\n[a,b] Systematic errors on the a, b measurement (Det block, defaults if absent):")
+                print(f"[a,b]   inputs : pump_intensity_error={_e['pump_intensity_error']:g}, "
+                      f"probe_photons_error={_e['probe_photons_error']:g}, timing_error={_e['timing_error']:g} fs, "
+                      f"spatial_error={_e['spatial_error']:g} µm, polarisation_error={_e['polarisation_error']:g} deg")
+                print(f"[a,b]   beams  : pump {_sy['pump_fwhm_s']*1e15:.1f} fs / probe {_sy['probe_fwhm_s']*1e15:.1f} fs (FWHM), "
+                      f"pump focus {_sy['pump_focus_fwhm_m']*1e6:.2f} µm, probe focus "
+                      f"{_sy['probe_focus_fwhm_m'][0]*1e6:.2f}×{_sy['probe_focus_fwhm_m'][1]*1e6:.2f} µm (FWHM), "
+                      f"z_R {_sy['zR_m']*1e6:.2f} µm, φ {_sy['phi_deg']:g}°")
+                print(f"[a,b]   eps_I   (pump intensity, 2·δI/I)          = {_sy['eps_I']:.4f}")
+                print(f"[a,b]   eps_P   (probe photons, δN/N)             = {_sy['eps_P']:.4f}")
+                print(f"[a,b]   eps_t   (timing, tau_t = {_sy['tau_t_s']*1e15:.1f} fs)          = {_sy['eps_t']:.4f}")
+                print(f"[a,b]   eps_D   (spatial, worst of x {_sy['eps_Dx']:.4f} / y {_sy['eps_Dy']:.4f}) = {_sy['eps_D']:.4f}")
+                print(f"[a,b]   eps_phi (polarisation, channel-specific)  = ∥ {_sy['eps_phi_par']:.4f} / ⊥ {_sy['eps_phi_perp']:.5f}")
+                print(f"[a,b]   Var(K)/K^2 = eps_I² + eps_P² + eps_t² + eps_D² = {_sy['VarK_rel']:.4f}"
+                      f"   (relative std of K = {np.sqrt(_sy['VarK_rel']):.3f})")
+                for tag, _rx, _ry, _lbl in roi_specs:
+                    _K = VB_photons["VB_perp"].get(tag, np.nan) / _v2
+                    print(f"[a,b]   {tag:<4} ({_lbl}): K = S_perp/(c-²sin²2φ) = {_K:.3e} ph/shot, "
+                          f"Var(K) = {_K**2 * _sy['VarK_rel']:.3e} ph²")
+                print(f"[a,b]   Z_max (systematic floor): a {_za:.2f}, b {_zb:.2f}")
+                for _s in nab_sets:
+                    print(f"[a,b]   {_s['label_a']}: " + ", ".join(f"{t} {_s['N_a'][t]:.3e}" for t in _s["N_a"]))
+                    print(f"[a,b]   {_s['label_b']}: " + ", ".join(f"{t} {_s['N_b'][t]:.3e}" for t in _s["N_b"]))
+        except Exception:
+            import traceback
+            print("[a,b] CRASH during the N_a / N_b computation!")
+            traceback.print_exc()
+            nab_sets, ab_sys = [], None
+
 
 
     # ─── TABLE OF RESULTS ON THE PLOT ───────────────────────────────────
-    if has_flow:  # only draw the table when a flow plot exists
+    if has_flow and show_table:  # only draw the table when a flow plot exists
         ax = plt.gca()
 
         # Label-column + numeric-column widths. The table adapts to 2 or 3 ROI
         # columns; roi3 (the N-shots-optimal box) is shown only when present.
-        _W  = 18
+        _W  = max(len(n) for n in ["Quantity", "SNR||"] + [s["label"] for s in nshots_sets]
+                  + [s[k] for s in nab_sets for k in ("label_a", "label_b")])
         _CW = 18
         _cols = [("roi", label_roi), ("roi2", label_roi2)]
         if roi3_info is not None and label_roi3 is not None:
@@ -3470,24 +3939,14 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             text_lines.append(_row("SNR||", ["n/a"] * len(_cols)))
             text_lines.append(_row("SNR⊥",  ["n/a"] * len(_cols)))
 
-        # --- N-shots to reach 1 sigma (z=1, FANO=1), PERP channel ---
-        #   N = (S + 2*B_eff)/S^2   with  B_eff = BG_raw * pol_purity  (equal ON/OFF shots).
-        #   line 1: pol_purity = 1e-5, full signal (roi3 is chosen to MINIMISE this).
-        #   line 2: pol_purity = 1e-7, signal 4x weaker (S -> S/4).
-        def _nshots_1sig(S, BG_raw, pol_purity, sig_factor=1.0):
-            if not (np.isfinite(S) and S > 0):
-                return np.nan
-            Seff = S * sig_factor
-            if Seff <= 0:
-                return np.nan
-            Beff = BG_raw * pol_purity if np.isfinite(BG_raw) else 0.0
-            return (Seff + 2.0 * Beff) / Seff**2
+        # N-shots, one row per analyser set: N(Z,T,P) = Z²(T·VB⊥ + (1+r)·P·BG)/(T·VB⊥)²
+        for _s in nshots_sets:
+            text_lines.append(_row(_s["label"], [_s["nshots"].get(tag, np.nan) for tag, _ in _cols]))
 
-        def _ns_vals(pol_purity, sig_factor):
-            return [_nshots_1sig(_vb("VB_perp", tag), BG_photons.get(tag, np.nan),
-                                 pol_purity, sig_factor) for tag, _ in _cols]
-        text_lines.append(_row("N-shots(1e-5)",     _ns_vals(1e-5, 1.0)))
-        text_lines.append(_row("N-shots(1e-7,S/4)", _ns_vals(1e-7, 0.25)))
+        # Shots to measure a and b to Z sigma (both channels + systematic floor Var(K)/K²)
+        for _key in ("a", "b"):
+            for _s in nab_sets:
+                text_lines.append(_row(_s[f"label_{_key}"], [_s[f"N_{_key}"].get(tag, np.nan) for tag, _ in _cols]))
 
         # Draw the text box
         table_text = "\n".join(text_lines)
@@ -3506,11 +3965,17 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     if has_flow:
         outdir = Path(project_dir) / "flows"
         outdir.mkdir(parents=True, exist_ok=True)
-        outfile = outdir / f"{file}_flowplot_{channel}.jpg"
+        _vt = f"{view_tag}_" if view_tag else ""
+        outfile = outdir / f"{file}_flowplot_{_vt}{channel}.jpg"
         plt.savefig(outfile)
-        print(f"[FLOW] Saved main flow plot to {outfile}")
+        print(f"[FLOW] Saved {'side-view' if view_tag else 'main'} flow plot to {outfile}")
     else:
         print(f"[FLOW] Skipped saving flow plot (no flow slices for channel '{channel}').")
+
+    # Tagged (e.g. side-view) calls only want the waterfall figure; do not
+    # overwrite the main channel summary npz that downstream tools read.
+    if not save_summary:
+        return params, res, fixedfall
 
 
     # ─── Save lightweight summary (.npz) ───────────────────────────────
@@ -3585,11 +4050,17 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         "roi2_box_m": (box_roi2_x, box_roi2_y),
         "roi_label":  label_roi,
         "roi2_label": label_roi2,
-        # ---- roi3: N-shots-optimal box (perp 1e-5, 1σ) ----------------
+        # ---- roi3: N-shots-optimal box (analyser set 1) ----------------
         "roi3_box_m":  (roi3_info["box_m"]  if roi3_info is not None else None),
         "roi3_label":  (label_roi3          if roi3_info is not None else None),
         "roi3_nshots": (roi3_info["nshots"] if roi3_info is not None else None),
         "roi3_fwhm_m": (roi3_info["fwhm_m"] if roi3_info is not None else None),
+        # ---- N-shots per analyser set: [{Z, T, P, label, relax_ratio, nshots:{roi tag: N}}]
+        "nshots_sets": nshots_sets,
+        # ---- shots to measure a, b per analyser set: [{Z, T, P, label_a, label_b, relax_ratio, N_a:{tag}, N_b:{tag}}]
+        "nab_sets": nab_sets,
+        # ---- systematic budget of the a, b measurement (eps per source, Var(K)/K², inputs)
+        "ab_systematics": ab_sys,
     }
 
     save_kwargs = dict(
@@ -3613,6 +4084,55 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
 
 
+
+
+def plot_flow_views(project_dir, file, views, default_xl=None):
+    """
+    Extra flow plots ("views") from the flow slices already saved in the figs pickle.
+
+    Each view is a dict (simulation.flow_views in the yaml):
+        name     : tag used in the file name  flows/<file>_flowplot_<name>_<channel>.jpg
+        z        : [z0, z1] window in m (default: the whole flow span)
+        y        : [y0, y1, step] vertical window; µm for y_mode 'um',
+                   units of the local box half-size for y_mode 'normalized' (default [-1, 1, 0.002])
+        y_mode   : 'um' (default) or 'normalized'
+        channels : list of channels (default ['main', 'VB_perp'])
+        resample : 'bin' (default) or 'interp'
+        table    : draw the Det metrics table (default False)
+        clim_decades : colour range = [peak/10**clim_decades, peak] of the window (default 10)
+    Can also be called after a run (e.g. from a notebook) to make new windows without re-simulating.
+    """
+    import gc
+    if not views:
+        return
+    pic = mu.loadPickle(str(Path(project_dir) / "pickles" / f"{file}_figs.pickle"), strict=1)
+    res = mu.loadPickle(str(Path(project_dir) / "pickles" / f"{file}_res.pickle"))
+    for v in views:
+        name   = str(v.get("name", "view"))
+        y_mode = str(v.get("y_mode", "um"))
+        y_def  = v.get("y", [-1.0, 1.0, 0.002] if y_mode == "normalized" else [-1000.0, 1000.0, 1.0])
+        z_win  = v.get("z", default_xl)
+        for ch in v.get("channels", ["main", "VB_perp"]):
+            try:
+                flow_plot(project_dir, file,
+                          vertical_type=v.get("vertical_type", "center"),
+                          channel=ch,
+                          gyax_def=[float(y) for y in y_def],
+                          xl=[float(z) for z in z_win] if z_win is not None else None,
+                          view_tag=name, save_summary=False,
+                          y_mode=y_mode, resample=v.get("resample", "bin"),
+                          show_table=bool(v.get("table", False)),
+                          clim_decades=v.get("clim_decades", 10),
+                          pic=pic, res=res)
+            except AssertionError:
+                pass          # channel not recorded
+            except Exception as err:
+                print(f"[FLOW-VIEW] '{name}' / {ch} failed: {err}")
+            finally:
+                plt.close("all")
+                gc.collect()
+    del pic, res
+    gc.collect()
 
 
 def overlay_flowplots(
@@ -5658,6 +6178,79 @@ def CRL_get_length(radius_mm,number,Energy):
 
 
 
+def optimise_crl_maxTransm(F: Field, el_dict: dict, params: dict) -> dict:
+    """
+    Choose the CRL geometry (number of lenses, radius of curvature ROC, aperture A)
+    that MAXIMISES the transmitted power of the field *F* arriving at the lens plane,
+    while keeping the focal length fixed at ``focal_des``.
+
+    Model (identical to the fixed Custom_CRL): focal f = ROC / (2·nb·δ), so for a
+    chosen integer ``nb`` the ROC is pinned by the focal requirement, ROC = 2·nb·δ·f.
+    The intensity transmission of one point is exp(-nb·μ·(r²/ROC + t_wall)); because
+    ROC ∝ nb at fixed f, the radial term exp(-μ·r²/(2δf)) is nb-INDEPENDENT and only
+    the web loss exp(-nb·μ·t_wall) grows with nb. A larger ROC (more lenses) allows a
+    larger sag-limited aperture A = 2·√(2·max_sag·ROC) (capped at A_max), capturing more
+    of the beam. The optimum trades beam capture against web loss. For a fixed nb the
+    best aperture is always the largest feasible one (the radial response is ≥ 0), so the
+    scan reduces to the lens count; ROC and A follow.
+
+    Physical limits honoured: ROC ≥ ``ROC_min``, A ≤ ``A_max``, per-element sag ≤ ``max_sag``.
+
+    Returns dict(nb, ROC, A, T, focal, clipped).
+    """
+    focal_des = yamlval('focal_des', el_dict, None)
+    if focal_des is None or focal_des <= 0:
+        raise ValueError("Custom_CRL_maxTransm: 'focal_des' (focal length, > 0 [m]) is required.")
+    ROC_min = float(yamlval('ROC_min', el_dict, 50e-6))
+    A_max   = float(yamlval('A_max',   el_dict, 2.0e-3))
+    t_wall  = float(yamlval('t_wall',  el_dict, yamlval('twall', el_dict, 30e-6)))
+    max_sag = float(yamlval('max_sag', el_dict, 1.0e-3))      # per-element parabola sag limit [m]
+    nb_max  = int(yamlval('nb_max',    el_dict, 300))
+    lens_material = yamlval('lens_material', el_dict, 'Be')
+
+    E_eV = params['photon_energy']
+    lam  = h * c / (E_eV * e)
+    beta, delta = get_index(lens_material, E_eV)             # Henke optical constants for the lens material
+    mu   = 4.0 * np.pi * beta / lam                          # intensity absorption coefficient [1/m]
+    if delta <= 0:
+        raise ValueError(f"Custom_CRL_maxTransm: non-physical delta={delta} for '{lens_material}' at {E_eV} eV.")
+
+    # Field intensity on the CURRENT grid (reg-aware: params['pxsize'] tracks F.siz/N).
+    N  = params['N']
+    dx = params['pxsize']
+    Na = (np.arange(N) - N // 2) * dx
+    xm, ym = np.meshgrid(Na, Na)
+    r  = np.sqrt(xm ** 2 + ym ** 2)
+    I  = np.nan_to_num(Intensity(0, F))
+    Ptot = float(I.sum())
+    if Ptot <= 0:
+        raise ValueError("Custom_CRL_maxTransm: incident field has zero power at the lens plane.")
+
+    # Radial intensity histogram (1-pixel bins) -> fast evaluation of the circular,
+    # radially-absorbing lens response for any aperture, even if the field is asymmetric.
+    idx  = (r / dx).astype(np.int64).ravel()
+    P    = np.bincount(idx, weights=I.ravel())
+    r_c  = (np.arange(P.size) + 0.5) * dx
+    abs_rad = np.exp(-mu * r_c ** 2 / (2.0 * delta * focal_des))   # nb-independent radial absorption
+    cumT = np.cumsum(P * abs_rad)                                  # transmitted power (pre web-loss) within r_c
+    cumP = np.cumsum(P)
+    r_beam = float(np.interp(0.9999 * Ptot, cumP, r_c)) if cumP[-1] > 0 else 0.0
+
+    nb_lo = max(1, int(np.ceil(ROC_min / (2.0 * delta * focal_des))))   # smallest nb with ROC ≥ ROC_min
+    best = None
+    for nb in range(nb_lo, nb_max + 1):
+        ROC   = 2.0 * nb * delta * focal_des
+        A_sag = 2.0 * np.sqrt(2.0 * max_sag * ROC)          # widest aperture this sag allows
+        A     = min(A_max, A_sag)
+        k     = int(np.searchsorted(r_c, A / 2.0, side='right'))
+        trans_pre = float(cumT[k - 1]) if k > 0 else 0.0
+        T     = float(np.exp(-nb * mu * t_wall) * trans_pre / Ptot)
+        if best is None or T > best['T']:
+            best = dict(nb=nb, ROC=float(ROC), A=float(A), T=T, focal=float(focal_des))
+    best['clipped'] = best['A'] < 2.0 * r_beam
+    return best
+
+
 def handle_custom_CRL(F: Field,
                       el_dict: dict,
                       params: dict,
@@ -5681,6 +6274,19 @@ def handle_custom_CRL(F: Field,
     nb_lenses = yamlval('nb_lenses',   el_dict, None)                     # Number of lenses in the CRL stack
     focal_lenght_stack = yamlval('focal_lenght_stack',   el_dict, None)   # Focal length of the stack                             [m]
     add_aperture = yamlval('add_aperture',   el_dict, 0)                  # If we want to add a circular aperture around the lens [Boolean]
+
+    # 1D cylindrical lens support (type: Custom_CRL_1D). Focuses in ONE direction only.
+    #   orientation 'vertical'   → focuses onto a vertical line   → optical power in x (horizontal)
+    #   orientation 'horizontal' → focuses onto a horizontal line → optical power in y (vertical)
+    lens_type   = str(el_dict.get("type", "Custom_CRL")).strip()
+    is_1d       = (lens_type == "Custom_CRL_1D")
+    orientation = str(el_dict.get("orientation", "vertical")).strip().lower()
+    if is_1d and orientation not in ("vertical", "horizontal"):
+        raise ValueError("Custom_CRL_1D: 'orientation' must be 'vertical' or 'horizontal'.")
+    # DABAM defect maps are only defined for 2D lenses → never applied to a 1D lens.
+    defects_on = (int(el_dict.get("defects", 0)) == 1) and (not is_1d)
+    if is_1d and int(el_dict.get("defects", 0)) == 1:
+        print("[Custom_CRL_1D] defects are not supported for 1D lenses → ignoring them.")
 
 
     # ────────────────────────────────────────────────
@@ -5741,20 +6347,37 @@ def handle_custom_CRL(F: Field,
     Na  = (np.arange(N) -  N // 2) * params['pxsize']       # axis in meters
     
     xm, ym = np.meshgrid(Na, Na)                        # xm, ym in [m]
-    r = np.sqrt(xm**2 + ym**2)
 
-    lens_half_thickness = np.full_like(r, L / 2)                # default to max thickness (outside aperture)
-    core_mask = r < A / 2 
-    lens_half_thickness[core_mask] = (xm[core_mask]**2 + ym[core_mask]**2) / (2 * ROC) + t_wall / 2
+    if is_1d:
+        # 1D cylindrical lens: parabolic profile along the focusing coordinate only,
+        # constant along the other (the groove runs along the non-focusing axis).
+        focus_coord = xm if orientation == "vertical" else ym
+        lens_half_thickness = np.full_like(focus_coord, L / 2)        # max thickness outside the clear slit
+        core_mask = np.abs(focus_coord) < A / 2                       # 1D (slit) clear aperture
+        lens_half_thickness[core_mask] = focus_coord[core_mask]**2 / (2 * ROC) + t_wall / 2
+    else:
+        r = np.sqrt(xm**2 + ym**2)
+        lens_half_thickness = np.full_like(r, L / 2)                # default to max thickness (outside aperture)
+        core_mask = r < A / 2
+        lens_half_thickness[core_mask] = (xm[core_mask]**2 + ym[core_mask]**2) / (2 * ROC) + t_wall / 2
+
     lens_thickness = 2 * lens_half_thickness
 
     # ────────────────────────────────────────────────
     # 4) Build aperture (optional) -------------------
     # ────────────────────────────────────────────────
     if add_aperture == 1:
-        custom_ap = {'elem': 'Hf', 'thickness': 0.0001, 'shape': 'circle',
-                    'size': A, 'invert': 1}
-        Aperture_transmission, _ = doap(custom_ap, params)
+        if is_1d:
+            # slit aperture: Hf absorber outside |focus_coord| < A/2, fully open in the other axis
+            slit_thk = np.zeros_like(focus_coord)
+            slit_thk[np.abs(focus_coord) >= A / 2] = 1e-4            # 0.1 mm Hf outside the clear slit
+            beta_hf, delta_hf = get_index('Hf', E_eV)
+            _, k_hf = thickness_to_phase_and_transmission(E_eV, delta_hf, beta_hf)
+            Aperture_transmission = np.exp(-k_hf * slit_thk)
+        else:
+            custom_ap = {'elem': 'Hf', 'thickness': 0.0001, 'shape': 'circle',
+                        'size': A, 'invert': 1}
+            Aperture_transmission, _ = doap(custom_ap, params)
         #F = MultIntensity(Aperture_transmission, F)  # aperture first
 
     # ────────────────────────────────────────────────
@@ -5767,7 +6390,7 @@ def handle_custom_CRL(F: Field,
     # 6) Defect phase (DABAM), then combine ----------
     # ────────────────────────────────────────────────
     total_phase_map = ideal_phase_map  # start with ideal
-    if int(el_dict.get("defects", 0)) == 1:
+    if defects_on:
         Z_def = build_dabam_defect_thickness_map(
             el_dict=el_dict, params=params, xm=xm, ym=ym, A_m=A
         )  # thickness delta [m] on (xm, ym) within aperture
@@ -5838,11 +6461,12 @@ def handle_custom_CRL(F: Field,
         save_dir=save_dir,
         sim_name=sim_name,
         lens_name=lens_name,
+        cut_axis=("y" if (is_1d and orientation == "horizontal") else "x"),
     )
 
 
-    # Image 2: DABAM diagnostics (only if defects requested)
-    if int(el_dict.get("defects", 0)) == 1:
+    # Image 2: DABAM diagnostics (only if defects requested; 2D lenses only)
+    if defects_on:
         import vibe.wavefront_fitting as wft
 
         # Try to use the cached arrays produced by build_dabam_defect_thickness_map
@@ -6062,8 +6686,10 @@ def plot_dabam_stack_diagnostics(projectdir, el_dict, dabam_sets,
 
     # totals row
     row_tot = len(dabam_sets)
+    random_info = el_dict.get("Z_random_info", None)
+    raw_lbl = ("Random raw map [µm]" if random_info else "Total raw (interpolated) [µm]")
     tot_defs = [
-        ("Total raw (interpolated) [µm]", Zraw_tot, ext_total_full),
+        (raw_lbl,                          Zraw_tot, ext_total_full),
         ("Total fit",                      Zfit_tot, extent_fit),
         ("Total residues (pre-remove)",    Zres_pre, extent_fit),
     ]
@@ -6093,11 +6719,19 @@ def plot_dabam_stack_diagnostics(projectdir, el_dict, dabam_sets,
                  transform=ax0.transAxes, ha='left', va='bottom', fontsize=9,
                  color='white', bbox=dict(boxstyle='round', facecolor='black',
                  alpha=0.35, linewidth=0))
-    if res_info:
+    if random_info is not None:
+        ax0.text(0.02, 0.98,
+                 (f"random synthetic map\n"
+                  f"RMS = {random_info['rms_target_m']*1e9:.1f} nm\n"
+                  f"band {random_info['f_low']:.2e}–{random_info['f_high']:.2e} m⁻¹\n"
+                  f"seed = {random_info['seed']}"),
+                 transform=ax0.transAxes, ha='left', va='top', fontsize=9,
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.75, linewidth=0))
+    elif res_info:
         ax0.text(0.02, 0.98,
                  (f"{res_info.get('policy','')}\n"
-                  f"Rsrc={res_info.get('Rsrc_um',0):.1f} µm → "
-                  f"Rdst={res_info.get('Rdst_um',0):.1f} µm\n"
+                  f"Rsrc={res_info.get('Rsrc_um') or 0:.1f} µm → "
+                  f"Rdst={res_info.get('Rdst_um') or 0:.1f} µm\n"
                   f"{res_info.get('note','')}"),
                  transform=ax0.transAxes, ha='left', va='top', fontsize=9,
                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.75, linewidth=0))
@@ -6105,22 +6739,41 @@ def plot_dabam_stack_diagnostics(projectdir, el_dict, dabam_sets,
     # bottom row: LF / HF / Total(LF+HF)
     row_bot = row_tot + 1
 
+    # The HF amplitude knob is already baked into Z_high / Z_totL. The spatial
+    # bandpass is only applied to the map that feeds the simulation, so we swap
+    # that panel for the actually-applied map so its effect is visible too.
+    Z_applied = el_dict.get("Z_sim_applied_roi", None)
+    bp_active = el_dict.get("Z_bandpass_info", None) is not None
+    hf_mult_v = el_dict.get("HF_multiplicator_applied",
+                            float(el_dict.get("HF_multiplicator", 1.0)))
+
+    low_arr,  low_ttl  = Z_low,  "Low frequency [µm]"
+    high_arr, high_ttl = Z_high, f"High frequency [µm] (×{hf_mult_v:g})"
+    tot_arr,  tot_ttl  = Z_totL, f"Total map = Low + High×{hf_mult_v:g} [µm]"
+    if Z_applied is not None and bp_active:
+        if defect_type == 1:
+            low_arr,  low_ttl  = Z_applied, "Low frequency — bandpassed [µm]"
+        elif defect_type == 2:
+            high_arr, high_ttl = Z_applied, f"High frequency (×{hf_mult_v:g}) — bandpassed [µm]"
+        else:
+            tot_arr,  tot_ttl  = Z_applied, f"Total (Low + High×{hf_mult_v:g}) — bandpassed [µm]"
+
     ax_low = axes[row_bot, 0]
-    imL = ax_low.imshow(Z_low * 1e6, origin="lower", cmap=cmap,
+    imL = ax_low.imshow(low_arr * 1e6, origin="lower", cmap=cmap,
                         extent=(extent_fit if extent_fit else None))
-    ax_low.set_title("Low frequency [µm]")
+    ax_low.set_title(low_ttl)
     fig.colorbar(imL, ax=ax_low, fraction=0.046)
 
     ax_high = axes[row_bot, 1]
-    imH = ax_high.imshow(Z_high * 1e6, origin="lower", cmap=cmap,
+    imH = ax_high.imshow(high_arr * 1e6, origin="lower", cmap=cmap,
                          extent=(extent_fit if extent_fit else None))
-    ax_high.set_title("High frequency [µm]")  # (renamed from 'residues (avg-removed)')
+    ax_high.set_title(high_ttl)
     fig.colorbar(imH, ax=ax_high, fraction=0.046)
 
     ax_tot = axes[row_bot, 2]
-    imT = ax_tot.imshow(Z_totL * 1e6, origin="lower", cmap=cmap,
+    imT = ax_tot.imshow(tot_arr * 1e6, origin="lower", cmap=cmap,
                         extent=(extent_fit if extent_fit else None))
-    ax_tot.set_title("Total map = Low + High [µm]")
+    ax_tot.set_title(tot_ttl)
     fig.colorbar(imT, ax=ax_tot, fraction=0.046)
 
     # highlight according to new semantics
@@ -6132,9 +6785,17 @@ def plot_dabam_stack_diagnostics(projectdir, el_dict, dabam_sets,
         emphasize(ax_tot)
 
     # title
-    summary = (f"defects={int(el_dict.get('defects',0))} | "
+    hf_mult = el_dict.get("HF_multiplicator_applied", float(el_dict.get("HF_multiplicator", 1.0)))
+    sf_info = el_dict.get("Z_bandpass_info", None)
+    bp_txt  = ("off" if not sf_info
+               else f"{sf_info['f_low']:.2e}-{sf_info['f_high']:.2e} m⁻¹")
+    src_txt = ("random(RMS={:.1f}nm, {:.1e}–{:.1e} m⁻¹)".format(
+                   random_info['rms_target_m']*1e9, random_info['f_low'], random_info['f_high'])
+               if random_info else "DABAM")
+    summary = (f"source={src_txt} | "
                f"type={defect_type} (1=LF, 2=HF, 3=LF+HF) | "
                f"remove_avg_profile={remove_avg} | "
+               f"HF_mult={hf_mult:g} | bandpass={bp_txt} | "
                f"custom_zernike={'on' if custom_active else 'off'}")
     fig.suptitle(f"{sim_name}, {lens_name}, Defects — {summary}", fontsize=13)
 
@@ -6341,13 +7002,17 @@ def plot_custom_crl_ideal(projectdir: Path,
                           filename_stem: str | None = None,
                           save_dir: Path | None = None,
                           sim_name: str | None = None,
-                          lens_name: str | None = None):
+                          lens_name: str | None = None,
+                          cut_axis: str = "x"):
     """
     Plot and save diagnostic figures for an ideal Custom CRL (no defects).
 
     Produces 2-D maps (thickness, transmission, phase) and 1-D center cuts,
     with an optional aperture transmission. The figure is saved in the
     ``Lens_diags`` directory for validation and documentation.
+
+    ``cut_axis`` selects the axis of the 1-D centre cuts: "x" (row, default) or
+    "y" (column) — used so a 1-D cylindrical lens is cut along its focusing axis.
     """
 
     import matplotlib.pyplot as plt
@@ -6357,9 +7022,16 @@ def plot_custom_crl_ideal(projectdir: Path,
     x_um = Na * 1e6
     extent_um = [Na[0]*1e6, Na[-1]*1e6, Na[0]*1e6, Na[-1]*1e6]
 
-    thickness_1d     = lens_thickness[center_idx, :] * 1e6
-    transmission_1d  = transmission_map[center_idx, :]
-    phase_1d         = total_phase_map_ideal[center_idx, :]
+    if str(cut_axis).lower() == "y":
+        thickness_1d     = lens_thickness[:, center_idx] * 1e6
+        transmission_1d  = transmission_map[:, center_idx]
+        phase_1d         = total_phase_map_ideal[:, center_idx]
+        cut_lbl          = "y [µm]"
+    else:
+        thickness_1d     = lens_thickness[center_idx, :] * 1e6
+        transmission_1d  = transmission_map[center_idx, :]
+        phase_1d         = total_phase_map_ideal[center_idx, :]
+        cut_lbl          = "x [µm]"
 
     ncols = 4 if add_aperture else 3
     fig, axes = plt.subplots(2, ncols, figsize=(5.2*ncols, 7), dpi=120)
@@ -6386,17 +7058,19 @@ def plot_custom_crl_ideal(projectdir: Path,
         plt.colorbar(im3, ax=axes[0,3], fraction=0.046)
 
     axes[1,0].plot(x_um, nb_lenses * thickness_1d); axes[1,0].grid()
-    axes[1,0].set(ylabel='Thickness [µm]', xlabel='x [µm]', title='1-D Thickness (centre cut)')
+    axes[1,0].set(ylabel='Thickness [µm]', xlabel=cut_lbl, title='1-D Thickness (centre cut)')
 
     axes[1,1].plot(x_um, transmission_1d, color='green'); axes[1,1].grid()
-    axes[1,1].set(ylabel='Transmission', xlabel='x [µm]', title='1-D Transmission (centre cut)')
+    axes[1,1].set(ylabel='Transmission', xlabel=cut_lbl, title='1-D Transmission (centre cut)')
 
     axes[1,2].plot(x_um, phase_1d, color='purple'); axes[1,2].grid()
-    axes[1,2].set(ylabel='Phase [rad]', xlabel='x [µm]', title='1-D Phase (centre cut)')
+    axes[1,2].set(ylabel='Phase [rad]', xlabel=cut_lbl, title='1-D Phase (centre cut)')
 
     if add_aperture:
-        axes[1,3].plot(x_um, Aperture_transmission[center_idx,:], color='black'); axes[1,3].grid()
-        axes[1,3].set(ylabel='Aperture T', xlabel='x [µm]', title='1-D Aperture (centre cut)')
+        ap_cut = (Aperture_transmission[:, center_idx] if str(cut_axis).lower() == "y"
+                  else Aperture_transmission[center_idx, :])
+        axes[1,3].plot(x_um, ap_cut, color='black'); axes[1,3].grid()
+        axes[1,3].set(ylabel='Aperture T', xlabel=cut_lbl, title='1-D Aperture (centre cut)')
 
     # --- prepend simulation and lens names ---
     sim_name  = sim_name  or Path(projectdir).stem
@@ -6491,6 +7165,38 @@ def maybe_spawn_VB_channels(bundle: FieldBundle,
 # =========================================================
 
 
+def _bandlimit_reg_phase(F, f, el_name="reg", ch_name="main", verbose=False):
+    """Remove the aliasing-prone field after a reg/dereg reference-phase Lens(F, f).
+
+    The reg/dereg elements multiply the field by a quadratic reference phase exp(i k r^2/2f).
+    That phase is only Nyquist-sampled out to r_Nyq = |f|*lambda/(2*dx); beyond r_Nyq the sampled
+    phase FOLDS (aliases) and acts like a spurious lens -> fake 'focused' rays on the flowplot.
+    Here we smoothly zero the field beyond r_Nyq (a soft cosine rolloff). It is a NO-OP whenever the
+    field is already contained within r_Nyq (the usual, well-resolved case); it only bites when the
+    box is large and coarse relative to |f| (e.g. deregularising at a re-expanded box).
+    """
+    if not f:
+        return F
+    N  = F.N
+    dx = F.siz / N
+    r_nyq = abs(f) * F.lam / (2.0 * dx)
+    half  = N * dx / 2.0
+    if r_nyq >= half:                      # whole grid below Nyquist -> nothing to clip
+        return F
+    rdtype = np.float32 if F.field.dtype == np.complex64 else np.float64
+    ax = (np.arange(N) - N // 2).astype(rdtype) * dx
+    r  = np.sqrt(ax[:, None] ** 2 + ax[None, :] ** 2)
+    r_in = 0.9 * r_nyq                      # smooth rolloff over the outer 10% -> no hard edge
+    mask = np.ones((N, N), dtype=rdtype)
+    band = (r > r_in) & (r <= r_nyq)
+    mask[band] = 0.5 * (1.0 + np.cos(np.pi * (r[band] - r_in) / (r_nyq - r_in)))
+    mask[r > r_nyq] = 0.0
+    F.field = (F.field * mask).astype(F.field.dtype, copy=False)
+    if verbose and ch_name == "main":
+        print(f"  [reg-bandlimit] {el_name}: r_Nyq={r_nyq*1e6:.0f}um vs box-half={half*1e6:.0f}um "
+              f"(f={f:.3g}m, dx={dx*1e6:.3f}um) -> removed aliasing-prone field beyond r_Nyq.")
+    return F
+
 
 def apply_element(bundle: FieldBundle,
                   el_name: str,
@@ -6519,6 +7225,29 @@ def apply_element(bundle: FieldBundle,
     # updated idempotently (not mangled channel-by-channel).
     _reg_was  = reg_prop_dict.get("regularized_propagation", False)
     _reg_fold = reg_prop_dict.get("reg_parabola_focus", None)
+    reg_bandlimit = params.get("reg_bandlimit", True)   # kill reg/dereg reference-phase aliasing
+
+    # ── Custom_CRL_maxTransm: choose the lens geometry ONCE (nb, ROC, A) that
+    #    maximises the transmitted power of a chosen channel's field arriving at this
+    #    plane, then apply it to every channel as an ordinary fixed-geometry Custom_CRL. ──
+    if el_type == 'Custom_CRL_maxTransm':
+        ch_opt = str(el_dict.get('channel_to_maximize', 'main'))
+        if ch_opt not in bundle.fields:
+            print(f"[Custom_CRL_maxTransm] channel '{ch_opt}' not present "
+                  f"(have {list(bundle.fields.keys())}) -> maximising 'main' instead.")
+            ch_opt = 'main'
+        geo = optimise_crl_maxTransm(bundle.fields[ch_opt], el_dict, params)
+        el_dict['ROC']       = geo['ROC']
+        el_dict['A']         = geo['A']
+        el_dict['nb_lenses'] = float(geo['nb'])
+        el_dict.pop('focal_lenght_stack', None)      # geometry is now pinned by nb + ROC
+        el_dict['type']      = 'Custom_CRL'          # fall through to the Custom_CRL handler below
+        el_type              = 'Custom_CRL'
+        print(f"[Custom_CRL_maxTransm] '{el_name}': maximise T({ch_opt}) at focal_des="
+              f"{geo['focal']:.3f} m -> nb_lenses={geo['nb']}, ROC={geo['ROC']*1e6:.1f} um, "
+              f"A={geo['A']*1e6:.1f} um, lens_material={yamlval('lens_material', el_dict, 'Be')} "
+              f"=> transmission({ch_opt}) = {geo['T']*100:.2f}%"
+              + ("   [beam CLIPPED by A_max / sag limit]" if geo['clipped'] else ""))
 
     for ch_name in list(bundle.fields.keys()):
 
@@ -6546,7 +7275,11 @@ def apply_element(bundle: FieldBundle,
                     # already regularised -> restore the physical field first, then
                     # re-strip with the new reference (through-focus flip).
                     F = Lens(F, _reg_fold)
+                    if reg_bandlimit:
+                        F = _bandlimit_reg_phase(F, _reg_fold, el_name, ch_name, verbose=True)
                 F = Lens(F, -f_ref)                # strip reference phase -> reduced field
+                if reg_bandlimit:
+                    F = _bandlimit_reg_phase(F, f_ref, el_name, ch_name, verbose=True)
                 bundle.fields[ch_name] = F
                 reg_prop_dict["reg_parabola_focus"]     = f_ref
                 reg_prop_dict["regularized_propagation"] = True
@@ -6557,6 +7290,8 @@ def apply_element(bundle: FieldBundle,
                 print("  [dereg] field is not regularised; nothing to do.")
             else:
                 F = Lens(F, _reg_fold)            # restore physical field
+                if reg_bandlimit:
+                    F = _bandlimit_reg_phase(F, _reg_fold, el_name, ch_name, verbose=True)
                 bundle.fields[ch_name] = F
                 reg_prop_dict["regularized_propagation"] = False
                 reg_prop_dict["reg_parabola_focus"]      = None
@@ -6624,21 +7359,26 @@ def apply_element(bundle: FieldBundle,
                 else:
                     f = el_dict['f']
                 if "reg" in el_type:
-                    if reg_prop_dict["reg_parabola_focus"] is None:
+                    # Decide from the state captured BEFORE the channel loop (_reg_fold/_reg_was) so the
+                    # shared reg_prop_dict gets the same value for every channel (main, VB_parr, VB_perp)
+                    # instead of the lens being applied once per channel.
+                    if _reg_fold is None:
                         reg_prop_dict["reg_parabola_focus"] = f
                         reg_prop_dict["regularized_propagation"] = True
                     else:
                         #for inserting second, that images the focus made by first CRL
-                        if reg_prop_dict["regularized_propagation"] == True:
+                        if _reg_was == True:
                             f2_tmp = f
                             #thin lens formula (zobrazovaci rovnice), where focus is the object
-                            reg_new_tmp = 1.0/(1.0/f2_tmp + 1.0/reg_prop_dict["reg_parabola_focus"])
+                            reg_new_tmp = 1.0/(1.0/f2_tmp + 1.0/_reg_fold)
                             reg_prop_dict["reg_parabola_focus"] = reg_new_tmp
-                            print("Re-regularizing by CRL")
+                            if ch_name == "main":
+                                print("Re-regularizing by CRL")
                         else:
                             reg_prop_dict["reg_parabola_focus"] = f
                             reg_prop_dict["regularized_propagation"] = True
-                            print("Unexpected regularizing by CRL")
+                            if ch_name == "main":
+                                print("Unexpected regularizing by CRL")
                 else:
                     F = Lens(f,0,0,F)
                     bundle.fields[ch_name] = F
@@ -6650,9 +7390,10 @@ def apply_element(bundle: FieldBundle,
 
             if aperture>0: #aperture
                 ap_dict = {}
-                ap_dict['elem'] = 'Hf' 
-                ap_dict['thickness'] = 0.0001
-                ap_dict['shape'] = 'circle'
+                if params.get('photon_energy', 1e4) >= 30.0:   # X-ray: 0.1 mm Hf aperture (Henke)
+                    ap_dict['elem'] = 'Hf'
+                    ap_dict['thickness'] = 0.0001
+                ap_dict['shape'] = 'circle'                    # optical probe: ideal opaque circle (no 'elem')
                 ap_dict['size'] = aperture
                 ap_dict['invert'] = 1
                 tmap,phasemap = doap(ap_dict,params)   # creating the transmission and phase map of the lens aperture
@@ -6737,7 +7478,7 @@ def apply_element(bundle: FieldBundle,
                 params['transmission_of_scatterer_'+el_name] = loss_on_scatterer
 
         ############# CUSTOM CRL ELEMENT ###############
-        if el_type == 'Custom_CRL':
+        if el_type in ('Custom_CRL', 'Custom_CRL_1D'):
             F = handle_custom_CRL(F, el_dict, params, projectdir)
             bundle.fields[ch_name] = F
             
@@ -6800,6 +7541,16 @@ def apply_element(bundle: FieldBundle,
                         if yamlval('do_phaseshift',el_dict,1):
                             F = MultPhase(phasemap,F)
                             bundle.fields[ch_name] = F
+
+
+        ############# ELEMENT : GRATING (bar/space, phase + absorption) ###########
+        if el_type == 'Grating':
+            tmap, phasemap = build_grating_maps(el_dict, params)
+            if yamlval('do_intensity', el_dict, 1):
+                F = MultIntensity(tmap, F)
+            if yamlval('do_phaseshift', el_dict, 1):
+                F = MultPhase(phasemap, F)
+            bundle.fields[ch_name] = F
 
 
         ############# ELEMENT : AIR LAYER (Geant4-derived PSF) ###########
@@ -6903,6 +7654,16 @@ def apply_element(bundle: FieldBundle,
             y_off=y_off
         )
 
+        # Focal sizes for the a,b systematic budget (spatial/timing terms), read back by flow_plot
+        params["IR_FWHM_diam_used"] = float(FWHM_diam)
+        try:
+            _Fm = bundle.fields["main"]
+            params["probe_TCC_fwhm_m"] = tuple(float(v) for v in fwhm_xy_of_image(Intensity(0, _Fm), _Fm.siz / _Fm.N))
+            print(f"[a,b] probe focus FWHM at TCC = {params['probe_TCC_fwhm_m'][0]*1e6:.2f} x "
+                  f"{params['probe_TCC_fwhm_m'][1]*1e6:.2f} um, pump focus FWHM = {FWHM_diam*1e6:.2f} um")
+        except Exception as _e:
+            print(f"[a,b] could not measure the probe focus at TCC: {_e}")
+
 
         # ---------------- Pulse Shape factor ---------------
         # The following factor is made to account for: 1) The finite pump Rayleigh length. 2) The probe and pump finite durations. 3) The time offset of the pump/probe focus
@@ -7003,7 +7764,8 @@ def main_VIBE(params,elements):
     if max_pixels>N: max_pixels=N
     if max_pixels == 0: max_pixels = N                        # If we put the parameter "subfigure_size_px" = 0 in the yaml, it means that we want to take the original number of cells N 
 
-    dtype = np.complex64
+    dtype = np.complex128 if params.get('precision', 'complex64') == 'complex128' else np.complex64
+    print(f"[VIBE] field precision: {np.dtype(dtype).name}")
 
     E_eV      = params['photon_energy']          # photon energy [eV]
     wavelength = h * c / (E_eV * e)             # λ = h·c / E     [m]
@@ -7091,6 +7853,10 @@ def main_VIBE(params,elements):
     _export_flow_imgs  = ("all_flowplot_planes" in _sf_tokens) or ("video" in _sf_tokens)
 
     figs = {}       # Definition of the pickle "figs"
+    # Optional full-resolution central cuts of every plane/channel (simulation.save_flow_lineouts: 1)
+    # -> pickles/<name>_lineouts.npz : light data to re-plot flow plots at the native grid resolution.
+    save_lineouts = bool(int(yamlval('save_flow_lineouts', params, 0) or 0))
+    lineouts = {}
     export = {}
     intensities = {}
     integ = 0.0
@@ -7107,7 +7873,7 @@ def main_VIBE(params,elements):
 
 
     
-    if 'edge_damping' in params:
+    if params.get('edge_damping') is not None:
         do_edge_damping = 1
         edge_damping_aperture = do_edge_damping_aperture(params)
     else:
@@ -7175,7 +7941,8 @@ def main_VIBE(params,elements):
             bundle = propagate_bundle(
                         bundle,
                         dz = delta_z,
-                        method='Fresnel' if method.lower() == 'fresnel' else 'FFT'
+                        method='Fresnel' if method.lower() == 'fresnel' else 'FFT',
+                        pad_frac=yamlval('zero_pad_frac', params, 0.0)
                     )
             F = bundle.fields["main"]                                                 # (keep the legacy variable alive)
         
@@ -7197,12 +7964,19 @@ def main_VIBE(params,elements):
                 method,
                 do_edge_damping,
                 edge_damping_aperture if do_edge_damping else None)
+
+        if el_type == "zoom_window":      # the window changed size without propagating -> refresh grid
+            propsize           = bundle.fields["main"].siz
+            params['propsize'] = propsize
+            params['pxsize']   = propsize / N
+            Na                 = (np.arange(N) - 0.5 * N) * params['pxsize'] / um
         
         all_channels = bundle.fields.items()     # [('main', F), ('VB_parr', F1) …]
 
         # ---- Prepare the plot variables ------------------------------
         #ZoomFactor    = yamlval('zoom',el_dict,1)
-        ZoomFactor = Zoom_global if Zoom_global != 1 else yamlval('zoom', el_dict, 1) # If Zoom Global exist, it is prioritized over the Zoom_factor (local for each plane)
+        _plane_zoom = 1 if el_type == "zoom_window" else yamlval('zoom', el_dict, 1)   # zoom_window's 'zoom' is not a plot zoom
+        ZoomFactor = Zoom_global if Zoom_global != 1 else _plane_zoom # If Zoom Global exist, it is prioritized over the Zoom_factor (local for each plane)
         do_plot       = yamlval('plot', el_dict, def_do_plot)
         plot_phase    = yamlval('plot_phase', params, 0)
         logg          = yamlval('figs_log', params, 1)
@@ -7233,6 +8007,12 @@ def main_VIBE(params,elements):
                 I_ch = I_after_air
             else:
                 I_ch = Intensity(0, Fch)
+
+            if save_lineouts and not yamlval('plot_phase', params, 0):
+                _n = I_ch.shape[0]; _c = _n // 2          # grid centre (x = 0) is index N//2
+                lineouts.setdefault(ch_name, []).append(
+                    (el_name, float(z), float(propsize), np.array(I_ch[_c, :], dtype=np.float64),
+                     np.array(I_ch[:, _c], dtype=np.float64), float(np.sum(I_ch)) * (propsize / _n) ** 2))
             
             # ----- Choice of unit for intensity -----
 
@@ -7330,7 +8110,8 @@ def main_VIBE(params,elements):
                 ZoomFactor=ZoomFactor, log=logg,
                 norms=norms,
                 el_dict=el_dict,
-                normalize=(unit_sel == 'relative')  # only normalize in relative mode
+                normalize=(unit_sel == 'relative'),  # only normalize in relative mode
+                average=not yamlval('plot_phase', params, 0),
             )
 
             # ---- keep planes in `figs` for the pickle + plane-image export ----
@@ -7720,6 +8501,62 @@ def main_VIBE(params,elements):
     mu.dumpPickle((elements_dict, params), str(res_name))
     print(f"Saved RES pickle to {res_name}")
 
+    #------------ Save the full-resolution central cuts (save_flow_lineouts) -----------
+    if save_lineouts and lineouts:
+        _s = float(params.get('scale_phot', 1.0)) if unit_sel == 'photons' else 1.0
+        _out = {"N": N, "scale_phot": float(params.get('scale_phot', 1.0)),
+                "unit": "photons/m^2" if unit_sel == 'photons' else "relative",
+                "element_names": np.array([el[1] for el in elements if not el[1].startswith("flow")]),
+                "element_z": np.array([el[0] for el in elements if not el[1].startswith("flow")], dtype=float)}
+        for _ch, _rows in lineouts.items():
+            _out[f"{_ch}_name"]    = np.array([r[0] for r in _rows])
+            _out[f"{_ch}_z"]       = np.array([r[1] for r in _rows])
+            _out[f"{_ch}_box"]     = np.array([r[2] for r in _rows])
+            _out[f"{_ch}_h"]       = (np.stack([r[3] for r in _rows]) * _s).astype(np.float32)
+            _out[f"{_ch}_v"]       = (np.stack([r[4] for r in _rows]) * _s).astype(np.float32)
+            _out[f"{_ch}_photons"] = np.array([r[5] for r in _rows]) * float(params.get('scale_phot', 1.0))
+        _ln = projectdir / "pickles" / f"{params['filename']}_lineouts.npz"
+        np.savez(_ln, **_out)
+        print(f"Saved full-resolution lineouts ({', '.join(f'{k}: {len(v)} planes' for k, v in lineouts.items())}) "
+              f"to {_ln}")
+        lineouts.clear()
+
+    #------------ Save the per-lens defect maps pickle -----------
+    # When save_pickle is 1 or 2, write a light, self-contained pickle holding
+    # the LF / HF / Total / applied defect maps of every Custom_CRL lens so they
+    # can be reloaded and analysed (RMS, PV, PSD …) in a notebook. Any effect
+    # applied to a map (HF_multiplicator, spatial_frequency_range) is baked in.
+    if save_pickle_mode in (1, 2):
+        lens_maps = {}
+        for _name, _eld in elements_dict.items():
+            if not isinstance(_eld, dict):
+                continue
+            if str(_eld.get("type", "")) != "Custom_CRL":
+                continue
+            if _eld.get("Z_highfreq_roi", None) is None:
+                continue  # no defects were built for this lens
+            lens_maps[_name] = {
+                "type": "Custom_CRL",
+                "A_aperture_m":            _eld.get("A_aperture_m"),
+                "pxsize_m":                _eld.get("pxsize_m", params.get("pxsize")),
+                "extent_um":               _eld.get("Z_fit_axes_um"),
+                "defect_type":             int(_eld.get("defect_type", 3)),
+                "remove_avg_profile":      int(_eld.get("remove_avg_profile", 0)),
+                "HF_multiplicator":        _eld.get("HF_multiplicator_applied",
+                                                    float(_eld.get("HF_multiplicator", 1.0))),
+                "spatial_frequency_range": _eld.get("Z_bandpass_info"),
+                "random_map":              _eld.get("Z_random_info"),
+                "Z_lowfreq":               _eld.get("Z_lowfreq_roi"),
+                "Z_highfreq":              _eld.get("Z_highfreq_roi"),
+                "Z_total":                 _eld.get("Z_total_lf_hf_roi"),
+                "Z_applied":               _eld.get("Z_sim_applied_roi"),
+                "disk_mask":               _eld.get("Z_disk_roi"),
+            }
+        if lens_maps:
+            lens_name = projectdir / "pickles" / f"{params['filename']}_lens_maps"
+            mu.dumpPickle(lens_maps, str(lens_name))
+            print(f"Saved LENS-MAPS pickle ({len(lens_maps)} lens) to {lens_name}")
+
     # ─── finalise the summary figure (if anything was drawn) ───
     if profiles_done:
         # left panel cosmetics
@@ -7779,19 +8616,30 @@ def main_VIBE(params,elements):
     flow_list = params.get("flow", None)
     xl = None
     if isinstance(flow_list, (list, tuple)) and len(flow_list) >= 2:
-        xl = [float(flow_list[0]), float(flow_list[1])]
+        if np.ndim(flow_list) == 2:      # several [z0, z1, n|step] ranges -> overall z span
+            xl = [float(min(r[0] for r in flow_list)), float(max(r[1] for r in flow_list))]
+        else:
+            xl = [float(flow_list[0]), float(flow_list[1])]
         print(f"[FLOW] Using x-limits from YAML flow = {xl}")
 
 
     # ─── Define vertical range for flow plot: gyax ───
-    initial_propsize_m = params.get("initial_propsize", 1000)  # fallback if not set earlier
-    Zoom_flow = params.get("Zoom_global", 1)
-    half_box_um = (initial_propsize_m / Zoom_flow) * 1e6 / 2
-    print(
-        f"[FLOW] Using zoom-aware box: "
-        f"propsize={initial_propsize_m*1e6:.1f} µm, "
-        f"Zoom={Zoom_flow} → window={2*half_box_um:.1f} µm")
-    gyax_step = 1  # resolution in µm
+    # Prefer the yaml's flow_plot_gyax (the generator sets it to the WIDEST box, so reg/dereg sims
+    # show the full expanded box); otherwise fall back to the base propsize / Zoom_global.
+    _fpg = params.get("flow_plot_gyax", None)
+    if isinstance(_fpg, (list, tuple)) and len(_fpg) >= 2:
+        half_box_um = max(abs(float(_fpg[0])), abs(float(_fpg[1])))
+        gyax_step   = float(_fpg[2]) if len(_fpg) > 2 else 1
+        print(f"[FLOW] Using flow_plot_gyax from yaml -> window = {2*half_box_um:.1f} µm")
+    else:
+        initial_propsize_m = params.get("initial_propsize", 1000)  # fallback if not set earlier
+        Zoom_flow = params.get("Zoom_global", 1)
+        half_box_um = (initial_propsize_m / Zoom_flow) * 1e6 / 2
+        gyax_step = 1  # resolution in µm
+        print(
+            f"[FLOW] Using zoom-aware box: "
+            f"propsize={initial_propsize_m*1e6:.1f} µm, "
+            f"Zoom={Zoom_flow} → window={2*half_box_um:.1f} µm")
     gyax_def = [-half_box_um, half_box_um, gyax_step]
     params["flow_plot_gyax_def"] = gyax_def
 
@@ -7809,6 +8657,30 @@ def main_VIBE(params,elements):
         except AssertionError:
             # channel wasn’t recorded – simply skip
             pass
+
+    # ─── Optional: side-view flow plots (vertical cutout along z) ───
+    # Triggered by adding 'flowplot_side' to simulation.save_figures. Saves
+    # flows/<sim>_flowplot_side_<channel>.jpg and does NOT touch the main npz.
+    _sf_side_raw = params.get("save_figures", None)
+    _sf_side = ({str(s).strip().lower() for s in _sf_side_raw}
+                if isinstance(_sf_side_raw, (list, tuple)) else set())
+    if "flowplot_side" in _sf_side:
+        for ch in ("main", "VB_parr", "VB_perp"):
+            try:
+                print(f"[DEBUG] flow_plot() SIDE view for channel={ch} → gyax_def = {gyax_def}")
+                flow_plot(projectdir,
+                        params['filename'],
+                        vertical_type="center-vert",
+                        channel=ch,
+                        gyax_def=gyax_def, xl=xl,
+                        view_tag="side", save_summary=False)
+            except AssertionError:
+                # channel wasn’t recorded – simply skip
+                pass
+
+    # ─── Optional: extra flow-plot windows (simulation.flow_views) ───
+    if params.get("flow_views"):
+        plot_flow_views(projectdir, params['filename'], params["flow_views"], default_xl=xl)
 
 
     # ─── Overlay flow figure (main + VB_perp) ───
@@ -7928,6 +8800,79 @@ def load_dabam2d(index: int, dabam_root: str | Path = None):
 
 
 
+def bandpass_filter_spatial(Z, dx, dy, f1, f2, mask=None):
+    """
+    Bandpass a 2-D height/thickness map in the spatial-frequency domain.
+
+    Parameters
+    ----------
+    Z : 2-D array
+        Map to filter (e.g. a defect thickness map, in meters).
+    dx, dy : float
+        Pixel pitch along x and y [m].
+    f1, f2 : float
+        The two cutoff spatial frequencies [cycles/m = m^-1]. Order is
+        irrelevant; frequencies with f_low <= |f_radial| <= f_high are kept and
+        everything else is suppressed. A frequency f corresponds to a spatial
+        feature size of 1/f (e.g. 1e6 m^-1 ↔ 1 µm features).
+    mask : 2-D bool array, optional
+        Re-applied after filtering (e.g. the lens disk) so that values outside
+        the aperture stay zero.
+    """
+    import numpy as np
+
+    f_low, f_high = sorted((abs(float(f1)), abs(float(f2))))
+    ny, nx = Z.shape
+    fx = np.fft.fftfreq(nx, d=dx)          # cycles/m
+    fy = np.fft.fftfreq(ny, d=dy)          # cycles/m
+    FX, FY = np.meshgrid(fx, fy)
+    FR = np.sqrt(FX**2 + FY**2)            # radial spatial frequency
+    band = (FR >= f_low) & (FR <= f_high)  # bandpass window
+    Zf = np.fft.ifft2(np.fft.fft2(Z) * band).real
+    if mask is not None:
+        Zf = np.where(mask, Zf, 0.0)
+    return Zf
+
+
+def generate_random_defect_map(xm, ym, disk_mask, rms_target, f1, f2, seed=-1):
+    """
+    Build a synthetic random defect thickness map on the simulation grid.
+
+    White Gaussian noise is bandpass-filtered to the spatial-frequency band
+    [f_low, f_high] (m^-1), restricted to the lens disk and scaled so its RMS
+    inside the disk equals ``rms_target`` [m]. This lets one study the darkfield
+    response to defects of a chosen strength (RMS) and typical size (a frequency
+    f ↔ a feature size 1/f). It replaces the DABAM maps and then runs through the
+    same LF/HF pipeline.
+
+    Parameters
+    ----------
+    xm, ym : 2-D arrays
+        Simulation coordinate grids [m].
+    disk_mask : 2-D bool array
+        Lens aperture mask (True inside the disk).
+    rms_target : float
+        Desired RMS height of the map inside the disk [m].
+    f1, f2 : float
+        The two spatial-frequency cutoffs [m^-1] (order irrelevant).
+    seed : int
+        Random seed; >= 0 → reproducible map, < 0 → fresh random map each run.
+    """
+    import numpy as np
+
+    s = int(seed)
+    rng = np.random.default_rng(s if s >= 0 else None)
+    dx = float(xm[0, 1] - xm[0, 0]) if xm.shape[1] > 1 else 1.0
+    dy = float(ym[1, 0] - ym[0, 0]) if ym.shape[0] > 1 else 1.0
+    noise = rng.standard_normal(xm.shape)
+    Z = bandpass_filter_spatial(noise, dx, dy, f1, f2, mask=disk_mask)
+    vals = Z[disk_mask]
+    cur_rms = float(np.sqrt(np.mean((vals - vals.mean()) ** 2))) if vals.size else 0.0
+    if cur_rms > 0:
+        Z = Z * (float(rms_target) / cur_rms)
+    Z = np.where(disk_mask, Z, 0.0)
+    return Z
+
 
 def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
     """
@@ -7941,7 +8886,15 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
       - HF (High frequency):
           remove_avg_profile=0 → HF = raw residues
           remove_avg_profile=1 → HF = residues after avg-removal
+      - HF_multiplicator (yaml): scalar applied to the HF map (default 1.0), so
+        HF → HF_multiplicator * HF before it is combined with LF.
+      - spatial_frequency_range (yaml): optional [f1, f2] in m^-1. When given, a
+        bandpass filter keeps only spatial frequencies between the two cutoffs in
+        the final simulation map (a frequency f ↔ feature size 1/f).
       - defect_type (yaml): 1=LF, 2=HF, 3=LF+HF → returned full-grid map follows this.
+      - random_map (yaml): [on, rms_m, f1, f2, seed]. When on, a synthetic random
+        defect map (target RMS, spatial band) replaces the DABAM maps and then runs
+        through the same LF/HF pipeline.
 
     Caches for plotting (ROI-based):
       Z_lowfreq_roi, Z_highfreq_roi, Z_total_lf_hf_roi
@@ -7964,6 +8917,20 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
     startmode    = int(el_dict.get("startmode", 1))
     nb_lenses    = int(el_dict.get("nb_lenses", 1))
     rescale_flag = int(el_dict.get("rescale_dabam", 1))
+    HF_mult      = float(el_dict.get("HF_multiplicator", 1.0))  # HF amplitude knob
+    sf_range_raw = el_dict.get("spatial_frequency_range", None) # [f1, f2] in m^-1 or None
+
+    # ---- random synthetic defect map (replaces DABAM maps when activated)
+    #      random_map = [on, rms_m, f1_m^-1, f2_m^-1, seed]
+    rand_raw = el_dict.get("random_map", None)
+    rand_active = (isinstance(rand_raw, (list, tuple)) and len(rand_raw) >= 1
+                   and int(float(rand_raw[0])) == 1)
+    rand_rms = rand_f1 = rand_f2 = rand_seed = None
+    if rand_active:
+        rand_rms  = float(rand_raw[1]) if len(rand_raw) > 1 else 5.0e-9
+        rand_f1   = float(rand_raw[2]) if len(rand_raw) > 2 else 1.0e6
+        rand_f2   = float(rand_raw[3]) if len(rand_raw) > 3 else 0.1e6
+        rand_seed = int(float(rand_raw[4])) if len(rand_raw) > 4 else -1
 
     # normalize dataset list
     if isinstance(expdata_raw, (list, tuple)):
@@ -7973,16 +8940,17 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
     else:
         exp_list = []
 
-    if defects_flag != 1 or len(exp_list) == 0:
+    if defects_flag != 1 or (len(exp_list) == 0 and not rand_active):
         return np.zeros_like(xm)
 
-    # pad/crop to nb_lenses
-    if len(exp_list) == 1:
-        exp_list *= nb_lenses
-    elif len(exp_list) < nb_lenses:
-        exp_list += [exp_list[-1]] * (nb_lenses - len(exp_list))
-    else:
-        exp_list = exp_list[:nb_lenses]
+    # pad/crop to nb_lenses (DABAM path only; random map has no experimental list)
+    if len(exp_list) > 0:
+        if len(exp_list) == 1:
+            exp_list *= nb_lenses
+        elif len(exp_list) < nb_lenses:
+            exp_list += [exp_list[-1]] * (nb_lenses - len(exp_list))
+        else:
+            exp_list = exp_list[:nb_lenses]
 
     # ---- sim grid & lens mask
     X_sim = xm[0, :]
@@ -7996,8 +8964,27 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
     dabam_sets = []
     first_Rsrc = None
     resample_note = None
+    random_info = None
 
-    for entry in exp_list:
+    if rand_active:
+        # Synthetic random map replaces the summed DABAM maps.
+        Zraw_total = generate_random_defect_map(xm, ym, disk_mask,
+                                                rand_rms, rand_f1, rand_f2, rand_seed)
+        f_lo, f_hi = sorted((abs(rand_f1), abs(rand_f2)))
+        random_info = {
+            "rms_target_m": float(rand_rms),
+            "f_low": f_lo, "f_high": f_hi,
+            "size_small_um": (1e6 / f_hi if f_hi > 0 else None),
+            "size_large_um": (1e6 / f_lo if f_lo > 0 else None),
+            "seed": int(rand_seed),
+        }
+        resample_note = (f"random map: RMS={rand_rms*1e9:.1f} nm, "
+                         f"{f_lo:.2e}-{f_hi:.2e} m^-1, seed={rand_seed}")
+        print(f"[RANDOM] Generated random defect map "
+              f"(RMS={rand_rms*1e9:.2f} nm, band {f_lo:.2e}-{f_hi:.2e} m^-1, "
+              f"seed={rand_seed})")
+
+    for entry in exp_list:  # empty (skipped) when random_map is active
         # parse an index
         if isinstance(entry, (int, np.integer)):
             idx = int(entry)
@@ -8147,6 +9134,12 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
         Z_high_roi = Zres_roi               # HF
         Zres_roi_post = Zres_roi            # for caching
 
+    # ---- HF amplitude knob: scale the high-frequency map before combining
+    if HF_mult != 1.0:
+        Z_high_roi    = HF_mult * Z_high_roi
+        Zres_roi_post = HF_mult * Zres_roi_post
+        print(f"[DABAM][HF_mult] High-frequency map scaled by {HF_mult}")
+
     Z_total_lf_hf_roi = Z_low_roi + Z_high_roi
 
     # ---- Choose the map FOR THE SIMULATION 
@@ -8156,6 +9149,23 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
         Z_final_roi = Z_high_roi
     else:                       # 3 → LF + HF
         Z_final_roi = Z_total_lf_hf_roi
+
+    # ---- Spatial-frequency bandpass filter (optional)
+    # Keeps only defect spatial frequencies between the two user cutoffs (m^-1).
+    sf_info = None
+    if isinstance(sf_range_raw, (list, tuple)) and len(sf_range_raw) >= 2:
+        f1, f2 = float(sf_range_raw[0]), float(sf_range_raw[1])
+        dx = float(X_roi[1] - X_roi[0]) if X_roi.size > 1 else float(params["pxsize"])
+        dy = float(Y_roi[1] - Y_roi[0]) if Y_roi.size > 1 else float(params["pxsize"])
+        Z_final_roi = bandpass_filter_spatial(Z_final_roi, dx, dy, f1, f2, mask=disk_roi)
+        f_low, f_high = sorted((abs(f1), abs(f2)))
+        sf_info = {"f_low": f_low, "f_high": f_high,
+                   "size_small_um": (1e6 / f_high if f_high > 0 else None),
+                   "size_large_um": (1e6 / f_low if f_low > 0 else None)}
+        s_small = f"{sf_info['size_small_um']:.3f}" if sf_info['size_small_um'] is not None else "∞"
+        s_large = f"{sf_info['size_large_um']:.3f}" if sf_info['size_large_um'] is not None else "∞"
+        print(f"[DABAM][bandpass] Keeping {f_low:.3e}–{f_high:.3e} m^-1 "
+              f"(features {s_small}–{s_large} µm)")
 
     # embed to full grid
     Z_final_full = np.zeros_like(xm)
@@ -8179,6 +9189,18 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
     el_dict["Z_highfreq_roi"]    = Z_high_roi
     el_dict["Z_total_lf_hf_roi"] = Z_total_lf_hf_roi
 
+    # new knobs (for plotting / provenance)
+    el_dict["HF_multiplicator_applied"] = HF_mult
+    el_dict["Z_bandpass_info"]          = sf_info
+    el_dict["Z_random_info"]            = random_info   # None for the DABAM path
+    el_dict["dabam_X"]                  = X_roi         # lets the plot use caches
+    el_dict["dabam_Y"]                  = Y_roi         # (skips the recompute path)
+    # actual map applied to the simulation (HF×mult + optional bandpass), ROI grid
+    el_dict["Z_sim_applied_roi"]        = Z_final_roi
+    el_dict["Z_disk_roi"]               = disk_roi      # aperture mask for RMS/PV
+    el_dict["A_aperture_m"]             = float(A_m)
+    el_dict["pxsize_m"]                 = float(params["pxsize"])
+
     # final applied map (full grid)
     el_dict["Z_def_resampled"]       = Z_final_full
     el_dict["Z_total_def_native"]    = Z_final_full
@@ -8194,9 +9216,13 @@ def build_dabam_defect_thickness_map(el_dict, params, xm, ym, A_m):
         "scale": (float((Rdst/first_Rsrc) if (first_Rsrc and first_Rsrc > 0) else 1.0)),
     }
 
-    print(f"[DABAM][APPLY] defect_type={defect_type} → "
+    bp_log = ("off" if sf_info is None
+              else f"{sf_info['f_low']:.3e}-{sf_info['f_high']:.3e} m^-1")
+    src_log = "random" if random_info is not None else "DABAM"
+    print(f"[DABAM][APPLY] source={src_log} | defect_type={defect_type} → "
           f"{'LF' if defect_type==1 else 'HF' if defect_type==2 else 'LF+HF'} map applied. "
-          f"remove_avg={remove_avg}")
+          f"remove_avg={remove_avg} | HF_multiplicator={HF_mult} | "
+          f"bandpass={bp_log}")
     return Z_final_full
 
 

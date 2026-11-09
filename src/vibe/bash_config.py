@@ -104,13 +104,17 @@ DEFAULT_SBATCH_PARAMS = {
 }
 
 
-def estimate_mem_gb(yaml_path, coeff_bytes_px=3100, floor_gb=64, round_to=10):
+def estimate_mem_gb(yaml_path, coeff_bytes_px=4300, floor_gb=64, round_to=10):
     """Safe --mem (GB) for one yaml, from its grid size N.
 
-    VIBE (now pyfftw complex64) peaks at ~2360 bytes/px * N**2 (measured at
-    N=8000). The default 3100 bytes/px keeps ~30% headroom. Returns None if N
-    can't be determined. NOTE: a request above a node's RAM (~1031 GB here) will
-    be rejected by SLURM -- the caller should skip sims whose estimate exceeds it.
+    VIBE's PEAK is during post-processing: flow_plot reloads the full figs pickle
+    once per channel (main/VB_parr/VB_perp) while the in-memory figs are still
+    held, so flow-heavy runs (many flow planes) dominate. Measured ~3267 bytes/px
+    at N=8000 on a 200-flow-plane sim (LP_8048 hit 209 GB and was OOM-killed under
+    a 200 GB cap from the old 3100 coeff). The default 4300 bytes/px keeps ~30%
+    headroom over that. Returns None if N can't be determined. NOTE: a request
+    above a node's RAM (~1031 GB here) will be rejected by SLURM -- the caller
+    should skip sims whose estimate exceeds it.
     """
     import math
     import yaml as _yaml

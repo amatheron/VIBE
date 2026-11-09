@@ -4,7 +4,7 @@ User defined functions for LightPipes for Python
 
 """
 import numpy as _np
-from LightPipes import Field, Intensity
+from LightPipes import Field, Intensity, LensFarfield
 from LightPipes.config import _USE_PYFFTW
 import matplotlib.pyplot as plt
 
