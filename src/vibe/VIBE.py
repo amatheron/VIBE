@@ -3016,6 +3016,16 @@ def nshots_perp(S, BG_raw, Z, T, P, relax_ratio=0.1):
     return Z * Z * (Seff + (1.0 + relax_ratio) * Beff) / Seff**2
 
 
+def nshots_par(S, BG_raw, Z, T, relax_ratio=0.1):
+    """Shots to a Z-sigma VB_parr detection: N = Z²(T·S + (1+r)·T·B)/(T·S)².
+    The parallel analyser transmits signal and background alike (B_eff = T·BG, no P)."""
+    return nshots_perp(S, BG_raw, Z, T, T, relax_ratio)
+
+
+# One-loop QED relative shift of b (1315/252·α/π ≈ 1.21 %): accuracy needed on b to see it at k = 1.
+_DELTA_B_1LOOP = 1315.0 / 252.0 * 7.2973525693e-3 / np.pi
+
+
 # ---- Heisenberg-Euler a, b measured from BOTH VB channels -----------------------------
 #   S_par = K (c+ - c- cos2φ)²,  S_perp = K c-² sin²2φ,  c± = b ± a  (a = 4, b = 7 -> c+ = 11, c- = 3)
 #   K (pump intensity², probe photons, overlap) is common to both channels and cancels in ratios;
@@ -3654,9 +3664,10 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
     # roi/roi2 key, or an unresolved adaptive box).
     t13 = float("nan")
     t75 = float("nan")
+    t_r3 = float("nan")     # roi3 (N-shots-optimal box), filled once roi3 is known
+    tr_scat = yamlval("transmission_of_scatterer_L2", params, 1)
     if key_central in intens:
         t1 = intens[key_central] / intens.get("start", 1.0)
-        tr_scat = yamlval("transmission_of_scatterer_L2", params, 1)
         _cen = intens[key_central]
 
         if _cen and "roi" in intens:
@@ -3731,6 +3742,16 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         import traceback
         print("[ROI3] CRASH during optimum-ROI computation!")
         traceback.print_exc()
+
+    # Shadow factor in roi3, same convention as roi/roi2 in main_VIBE: the Det_main integral in the
+    # legacy 'sum × propsize²' units of intensities[...] (= integrate_rect × N²) over the central plane.
+    if roi3_info is not None and intens.get(key_central):
+        _m_img, _, _m_prop, _ = pic["Det_main"]
+        _m_n = _m_img.shape[0]
+        _r3x, _r3y = roi3_info["box_m"]
+        t_r3 = (integrate_rect(_m_img, float(_m_prop) / _m_n, _r3x, _r3y) * _m_n**2
+                / intens[key_central] / tr_scat)
+        print(f"SF roi3 = {t_r3:.1e}")
 
     # ─── VB SIGNAL (Detector photon count) ───────────────────────────
     VB_photons = {}   # {'VB_parr': {'roi': v, 'roi2': v}, ...}   (string keys)
@@ -3808,17 +3829,24 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                 if np.isfinite(vb_val) and np.isfinite(bg_val) and bg_val != 0:
                     SNR[(pol, tag)] = vb_val / bg_val
 
-    # ─── N-shots per analyser set (perp channel, S = VB⊥ and B = BG as in the table) ───
+    # ─── N-shots per analyser set, both channels (S = VB⊥ / VB|| and B = BG as in the table) ───
+    #   N⊥ : B_eff = P·BG (crossed analyser),  N|| : B_eff = T·BG (parallel analyser)
     nshots_sets = []
     for _s in _analyser_sets:
         _vals = {tag: nshots_perp(VB_photons.get("VB_perp", {}).get(tag, np.nan),
                                   BG_photons.get(tag, np.nan),
                                   _s["Z"], _s["T"], _s["P"], _relax_ratio)
                  for tag, *_ in roi_specs}
-        nshots_sets.append({**_s, "relax_ratio": _relax_ratio, "nshots": _vals})
+        _vals_par = {tag: nshots_par(VB_photons.get("VB_parr", {}).get(tag, np.nan),
+                                     BG_photons.get(tag, np.nan),
+                                     _s["Z"], _s["T"], _relax_ratio)
+                     for tag, *_ in roi_specs}
+        nshots_sets.append({**_s, "relax_ratio": _relax_ratio,
+                            "label_perp": "N⊥" + _s["label"][1:], "label_par": "N||" + _s["label"][1:],
+                            "nshots": _vals, "nshots_par": _vals_par})
 
     # ─── N_a / N_b: shots to measure the Heisenberg-Euler a, b to Z sigma (both channels) ───
-    nab_sets, ab_sys = [], None
+    nab_sets, ab_sys, nb_1loop = [], None, None
     if VB_photons.get("VB_parr") and VB_photons.get("VB_perp"):
         try:
             _pump_foc = params.get("IR_FWHM_diam_used")
@@ -3852,6 +3880,20 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                                  "label_a": "N_a" + _s["label"][1:], "label_b": "N_b" + _s["label"][1:],
                                  "N_a": _na, "N_b": _nb})
 
+            # N_b to reach the one-loop accuracy: sigma_b/b = eps = delta_b at k = 1 -> Z_eff = k/eps
+            # (analyser set 1). Also without systematics, since the floor usually makes it inf.
+            _a1 = _analyser_sets[0]
+            _z1 = 1.0 / _DELTA_B_1LOOP
+            _sys0 = {**ab_sys, "VarK_rel": 0.0, "eps_phi_par": 0.0, "eps_phi_perp": 0.0}
+            _args = {tag: (VB_photons["VB_parr"].get(tag, np.nan), VB_photons["VB_perp"].get(tag, np.nan),
+                           BG_photons.get(tag, np.nan)) for tag, *_ in roi_specs}
+            nb_1loop = {"k": 1.0, "eps": _DELTA_B_1LOOP, "Z_eff": _z1, "T": _a1["T"], "P": _a1["P"],
+                        "relax_ratio": _relax_ratio, "label": "N_b 1rst loop",
+                        "N_b": {t: nshots_ab(*a, _z1, _a1["T"], _a1["P"], ab_sys, _relax_ratio)[1]
+                                for t, a in _args.items()},
+                        "N_b_stat": {t: nshots_ab(*a, _z1, _a1["T"], _a1["P"], _sys0, _relax_ratio)[1]
+                                     for t, a in _args.items()}}
+
             if channel == "main":
                 _e, _sy = ab_sys["errors"], ab_sys
                 _v2 = (_HE_B - _HE_A)**2 * np.sin(2 * np.deg2rad(_sy["phi_deg"]))**2   # S_perp = K c-² sin²2φ
@@ -3879,11 +3921,15 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
                 for _s in nab_sets:
                     print(f"[a,b]   {_s['label_a']}: " + ", ".join(f"{t} {_s['N_a'][t]:.3e}" for t in _s["N_a"]))
                     print(f"[a,b]   {_s['label_b']}: " + ", ".join(f"{t} {_s['N_b'][t]:.3e}" for t in _s["N_b"]))
+                print(f"[a,b]   N_b 1rst loop (k=1, eps=delta_b={_DELTA_B_1LOOP:.4%}, Z_eff={_z1:.1f}, "
+                      f"T={_short_num(_a1['T'])}, P={_short_num(_a1['P'])}): "
+                      + ", ".join(f"{t} {nb_1loop['N_b'][t]:.3e} (stat only {nb_1loop['N_b_stat'][t]:.3e})"
+                                  for t in nb_1loop["N_b"]))
         except Exception:
             import traceback
             print("[a,b] CRASH during the N_a / N_b computation!")
             traceback.print_exc()
-            nab_sets, ab_sys = [], None
+            nab_sets, ab_sys, nb_1loop = [], None, None
 
 
 
@@ -3893,7 +3939,8 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
 
         # Label-column + numeric-column widths. The table adapts to 2 or 3 ROI
         # columns; roi3 (the N-shots-optimal box) is shown only when present.
-        _W  = max(len(n) for n in ["Quantity", "SNR||"] + [s["label"] for s in nshots_sets]
+        _W  = max(len(n) for n in ["Quantity", "SNR||", "N_b 1rst loop"]
+                  + [s[k] for s in nshots_sets for k in ("label_perp", "label_par")]
                   + [s[k] for s in nab_sets for k in ("label_a", "label_b")])
         _CW = 18
         _cols = [("roi", label_roi), ("roi2", label_roi2)]
@@ -3913,8 +3960,8 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         text_lines.append(_row("Quantity", [lbl for _, lbl in _cols]))
         text_lines.append("-" * (_W + len(_cols) * (3 + _CW)))
 
-        # Shadow factors (roi/roi2 only; roi3 has no SF)
-        _sf = {"roi": t13, "roi2": t75}
+        # Shadow factors
+        _sf = {"roi": t13, "roi2": t75, "roi3": t_r3}
         text_lines.append(_row("SF", [_sf.get(tag, "n/a") for tag, _ in _cols]))
 
         # VB photon counts
@@ -3939,14 +3986,24 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             text_lines.append(_row("SNR||", ["n/a"] * len(_cols)))
             text_lines.append(_row("SNR⊥",  ["n/a"] * len(_cols)))
 
-        # N-shots, one row per analyser set: N(Z,T,P) = Z²(T·VB⊥ + (1+r)·P·BG)/(T·VB⊥)²
+        # N-shots, two rows per analyser set:
+        #   N⊥(Z,T,P) = Z²(T·VB⊥ + (1+r)·P·BG)/(T·VB⊥)²,  N||(Z,T,P) = Z²(T·VB|| + (1+r)·T·BG)/(T·VB||)²
         for _s in nshots_sets:
-            text_lines.append(_row(_s["label"], [_s["nshots"].get(tag, np.nan) for tag, _ in _cols]))
+            text_lines.append(_row(_s["label_perp"], [_s["nshots"].get(tag, np.nan) for tag, _ in _cols]))
+            text_lines.append(_row(_s["label_par"],  [_s["nshots_par"].get(tag, np.nan) for tag, _ in _cols]))
 
         # Shots to measure a and b to Z sigma (both channels + systematic floor Var(K)/K²)
         for _key in ("a", "b"):
             for _s in nab_sets:
                 text_lines.append(_row(_s[f"label_{_key}"], [_s[f"N_{_key}"].get(tag, np.nan) for tag, _ in _cols]))
+
+        # Shots to reach the one-loop accuracy on b (k = 1, eps = delta_b); when the systematic floor
+        # makes it inf, the statistics-only value is shown next to it.
+        if nb_1loop is not None:
+            def _nb1(tag):
+                v, v0 = nb_1loop["N_b"].get(tag, np.nan), nb_1loop["N_b_stat"].get(tag, np.nan)
+                return f"inf (stat {v0:.1e})" if (np.isinf(v) and np.isfinite(v0)) else v
+            text_lines.append(_row(nb_1loop["label"], [_nb1(tag) for tag, _ in _cols]))
 
         # Draw the text box
         table_text = "\n".join(text_lines)
@@ -3986,6 +4043,7 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
             "SFA13": t13 if "t13" in locals() else np.nan,
             "SFA75": t75 if "t75" in locals() else np.nan,
             "Ratio": (t75/t13) if ("t13" in locals() and "t75" in locals()) else np.nan,
+            "SF_roi3": t_r3,
         }
     except Exception:
         shadow_data = {}
@@ -4059,6 +4117,8 @@ def flow_plot(project_dir, file, cl=[1e-11,50], gyax_def=[-1000,1000,1], vertica
         "nshots_sets": nshots_sets,
         # ---- shots to measure a, b per analyser set: [{Z, T, P, label_a, label_b, relax_ratio, N_a:{tag}, N_b:{tag}}]
         "nab_sets": nab_sets,
+        # ---- shots to reach the one-loop accuracy on b (k=1, eps=delta_b, analyser set 1)
+        "nb_1loop": nb_1loop,
         # ---- systematic budget of the a, b measurement (eps per source, Var(K)/K², inputs)
         "ab_systematics": ab_sys,
     }

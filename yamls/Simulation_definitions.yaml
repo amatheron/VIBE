@@ -331,12 +331,13 @@ Det:                                 # Detector plane where the total number of 
   #                            re-simulation needed as long as the pickle still
   #                            holds the detector planes).
   #
-  #   N-SHOTS (perp channel) to reach a Z-sigma detection, one table row per analyser set:
-  #       N = Z² (T·S + (1+r)·P·B) / (T·S)²
-  #     S = VB⊥ and B = BG exactly as reported in the table, Z = Confidence_level_Z,
+  #   N-SHOTS to reach a Z-sigma detection, two table rows per analyser set:
+  #       N⊥ = Z² (T·S⊥ + (1+r)·P·B) / (T·S⊥)²     (crossed analyser rejects the background)
+  #       N|| = Z² (T·S|| + (1+r)·T·B) / (T·S||)²   (parallel analyser transmits signal and background)
+  #     S = VB⊥ / VB|| and B = BG exactly as reported in the table, Z = Confidence_level_Z,
   #     T = Analyser_transm_seeded_signal, P = Analyser_pola_purity,
   #     r = nshots_relax_nolax_ratio (default 0.1 → the 1.1·B term).
-  #     Row label = N(Z,T,P), e.g. N(1.645,0.5,1e-4).
+  #     Row labels = N⊥(Z,T,P) and N||(Z,T,P), e.g. N⊥(1.645,0.5,1e-4) (P is not used by N||).
   #     Extra sets: append a suffix 2, 3, … to the keys (Analyser_pola_purity2, …);
   #     any key missing in a set takes the default below. Stored in meta['nshots_sets'].
   #
@@ -354,6 +355,11 @@ Det:                                 # Detector plane where the total number of 
   #       εφ∥, εφ⊥ = largest |S(φ±δφ)/S(φ) - 1| per channel (δφ = polarisation_error), not part of K.
   #     The ε's, Var(K)/K², K and Var(K) per ROI, Z_max and N_a/N_b are printed in the log ([a,b] lines).
   #     Stored in meta['nab_sets'] and meta['ab_systematics'].
+  #
+  #   N_b 1rst loop : last table row, shots to measure b to the one-loop QED accuracy, k = 1 and
+  #     ε = δ_b = 1315/252·α/π ≈ 1.21 %  →  the N_b formula above with Z = k/ε ≈ 82.5 (analyser set 1).
+  #     It is inf when the systematic floor is above δ_b; the cell then reads 'inf (stat N)', N being the
+  #     value without systematics (Var(K) = εφ = 0). Stored in meta['nb_1loop'].
   roi_mode: containment              # fixed | containment | fwhm  (omit → auto)
   roi: 0.5                           # containment: 50 % of the VB_perp signal
   roi2: 0.9                          # containment: 90 % of the VB_perp signal
@@ -618,12 +624,15 @@ simulation:                          # General simulation parameters
 #   meta['roi3_label']                       ← e.g. '85.2×44.5µm opt'
 #   meta['roi3_nshots']                      ← N-shots of analyser set 1 in the optimal box
 #   meta['roi3_fwhm_m']                      ← (FWHM_x, FWHM_y) of the VB_perp signal
+#   meta['shadow_factors']['SF_roi3']        ← shadow factor in the optimal box (same definition as SFA13/SFA75)
 #
-# N-shots per analyser set:
-#   meta['nshots_sets']                      ← [{Z, T, P, label, relax_ratio, nshots: {'roi','roi2','roi3': N}}]
+# N-shots per analyser set (N⊥ = perp channel, N|| = parallel channel):
+#   meta['nshots_sets']                      ← [{Z, T, P, label, label_perp, label_par, relax_ratio,
+#                                               nshots: {'roi','roi2','roi3': N⊥}, nshots_par: {roi tag: N||}}]
 #
 # Shots to measure a, b (both channels) per analyser set + the systematic budget:
 #   meta['nab_sets']                         ← [{Z, T, P, label_a, label_b, relax_ratio, N_a: {roi tag: N}, N_b: {roi tag: N}}]
+#   meta['nb_1loop']                         ← {k, eps, Z_eff, T, P, relax_ratio, label, N_b: {roi tag: N}, N_b_stat: {roi tag: N}}
 #   meta['ab_systematics']                   ← {eps_I, eps_P, eps_t, eps_D (eps_Dx, eps_Dy), eps_phi_par, eps_phi_perp,
 #                                               VarK_rel = Var(K)/K², tau_t_s, Sigma_m, zR_m, errors, phi_deg,
 #                                               pump/probe durations and focal FWHMs used}

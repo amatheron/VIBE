@@ -228,3 +228,18 @@ In the code the Custom_CRL block is parametrised by  : ROC (radius of curvature)
 
 
 
+
+---
+
+## Optical (IR) probes and all-reflective setups
+
+VIBE can also propagate an **optical probe** (e.g. 800 nm) through mirror-based setups:
+
+- **Probe wavelength**: give `Xbeam.wavelength` (m) instead of `photonenergy` (eV).
+- **Unfolding mirrors**: plane mirrors unfold exactly (pure coordinate flip). An aligned ideal off-axis parabola (OAP) is an aberration-free focuser for its collimated design beam, i.e. an ideal thin lens with f = reflected focal length (`lens` / `lens_reg`). Holes in mirrors are ideal apertures (projected shape). Not modelled: OAP pupil-mapping asymmetry, misalignment aberrations, vector/polarisation effects at high NA.
+- **Ideal apertures**: Henke X-ray tables are invalid at optical energies, so VIBE stops with an error if a material element is used for E < 30 eV. Use `shape: circle` **without** `elem` (optional soft edge `edge_width`), or `gaussian`/`square`/... shapes, and ideal lenses with `size: 0, celestre: 0, seiboth: 0`.
+- **Large, fast optics (e.g. 15 cm f/2 focused to ~1 µm)**: never sample the focusing phase on the grid (it would need dx ≤ λf/D). Use `lens_reg` (box shrinks with the converging cone), `dereg` just before the focus, `reg` with a **negative** `reg-by-f` just after it (box re-expands), optional `zoom_window` after an aperture, and `lens_reg` again for re-imaging lenses. N is then set by the space-bandwidth product (a few thousand to ~16k) instead of box/dx_focus.
+- **Precision**: `simulation.precision: complex128` for extreme signal/background ratios.
+- **Flow plots** for boxes varying by orders of magnitude: `simulation.flow_views` (normalized-y global view + zoomed z/y windows).
+
+`yamls/yaml_IRDF_setup.py` generates such a configuration (holed plane mirror → f/2 OAP → TCC → pump-OAP hole → lens → pinhole → detector) and derives all reg/dereg/zoom positions from N, checking that the beam fits the useful box in every segment. The holed mirror is placed automatically so that the OAP images it onto the pump-OAP hole. Each configuration yields a **signal run** (`_S`: VB on, 0.1 µm focal pixels) and a **background run** (`_B`: VB off, 0.8 µm focal pixels and a ~13 mm focal box, needed for a converged probe leakage), because all VIBE channels share one grid. The last cells of `notebooks/Run_VIBE.ipynb` generate, launch and summarise these runs.

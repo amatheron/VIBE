@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=LP_2416
+#SBATCH --job-name=LP_8525
 #SBATCH --partition=hij-gpu
 #SBATCH --cpus-per-task=128
 #SBATCH --time=7-00:00:00
 #SBATCH --mem=1000GB
-#SBATCH --output=/home/yu79deg/VIBE/bash/bash_output/LP_2416.log
-#SBATCH --error=/home/yu79deg/VIBE/bash/bash_output/LP_2416.err
+#SBATCH --output=/home/yu79deg/VIBE/bash/bash_output/LP_8525.log
+#SBATCH --error=/home/yu79deg/VIBE/bash/bash_output/LP_8525.err
 #SBATCH --chdir=/home/yu79deg/VIBE
 
 # --- Micromamba activation ---
@@ -29,4 +29,4 @@ export HDF5_USE_FILE_LOCKING=FALSE
 # `-X faulthandler` and `-X dev` complement the env-var above (extra dev-mode
 # warnings + guaranteed faulthandler regardless of env stripping); `-u` is
 # unbuffered stdout (redundant with PYTHONUNBUFFERED but harmless).
-python -X faulthandler -X dev -u /home/yu79deg/VIBE/src/vibe/VIBE.py --yaml /home/yu79deg/VIBE/yamls/LP_2416.yaml
+python -X faulthandler -X dev -u /home/yu79deg/VIBE/src/vibe/VIBE.py --yaml /home/yu79deg/VIBE/yamls/LP_8525.yaml
